@@ -51,6 +51,9 @@ x-settings:
   max-context-chars: &max-context-chars "200000"
   # Most characters kept from one tool's output.
   tool-output-chars: &tool-output-chars "12000"
+  # ./ts learn: most files to read, and most time, per app.
+  learn-max-files: &learn-max-files "40"
+  learn-minutes: &learn-minutes "30"
 
   # --- Kubernetes ---
   # No setting: one kubeconfig per cluster in ./kube,
@@ -108,10 +111,13 @@ services:
       PYTHONUNBUFFERED: "1"
       MAX_CONTEXT_CHARS: *max-context-chars
       TOOL_OUTPUT_CHARS: *tool-output-chars
+      LEARN_MAX_FILES: *learn-max-files
+      LEARN_MINUTES: *learn-minutes
     volumes:
       - ./src:/app/src:ro
       - ./logs:/logs
       - ./kube:/kube:ro
       - ./certs:/certs:ro
+      - ./runbooks:/runbooks:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - /:/host:ro,rslave

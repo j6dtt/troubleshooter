@@ -133,6 +133,34 @@ compose.yaml (default /apps and /apps2). To add a folder:
 It reads code but can't edit or run it. It shows a fix as a diff for
 you to apply. It skips .env, key files, links, .git and node_modules.
 
+RUNBOOKS
+
+A runbook is a page of notes on one app: what it depends on, its
+ports, logs, errors and what to check first. Chat reads it whenever
+that app comes up. To draft one, run this on the host that has the app:
+
+  ./ts learn /apps/myapp
+
+It reads the app's key files, adds what is running now, and saves
+runbooks/<this host>/myapp.md. Each host has its own folder, so hosts
+sharing this install never overwrite each other. Chat prefers this
+host's runbooks and can read the others.
+
+Each fact names its file:line. The model must quote the words a fact
+came from, and a fact whose words aren't in the file is dropped. That
+proves the words exist, not that the model understood them, so check
+the draft. Then:
+
+  1. fix anything wrong, and fill in Your notes
+  2. change the line "Status: DRAFT" to "Status: REVIEWED"
+
+Chat treats a draft as unconfirmed. Running learn again replaces a
+draft, but refuses a reviewed runbook unless you add --force. --force
+keeps the old one as myapp.md.bak.
+
+learn skips .env, key files, tests, backups and logs, and masks
+secrets before the model sees them. The folder must be in file-roots.
+
 SETTINGS
 
 In the block at the top of compose.yaml. After a change, run
@@ -148,6 +176,8 @@ docker compose up -d. Secrets go in .env.
   file-roots           folders it may read and search
   max-steps            most model rounds for one question
   max-seconds          most time for one question
+  learn-max-files      most files ./ts learn reads per app
+  learn-minutes        most time ./ts learn takes per app
 
   LLM_API_KEY in .env  the model's key; empty for vLLM
 

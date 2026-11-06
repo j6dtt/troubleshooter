@@ -32,6 +32,9 @@ class Settings:
     host_root: str = "/host"
     log_dir: str = "/logs"
     kube_dir: str = "/kube"
+    runbook_dir: str = "/runbooks"
+    learn_max_files: int = 40
+    learn_minutes: int = 30
     helper_image: str = "troubleshooter-runtime:2"
 
 
@@ -56,5 +59,8 @@ def load():
         host_root=os.environ.get("HOST_ROOT", "/host"),
         log_dir=os.environ.get("LOG_DIR", "/logs"),
         kube_dir=os.environ.get("KUBE_DIR", "/kube"),
+        runbook_dir=os.environ.get("RUNBOOK_DIR", "/runbooks"),
+        learn_max_files=int(os.environ.get("LEARN_MAX_FILES", "40")),
+        learn_minutes=int(os.environ.get("LEARN_MINUTES", "30")),
         helper_image=os.environ.get("HELPER_IMAGE", "troubleshooter-runtime:2"),
     )

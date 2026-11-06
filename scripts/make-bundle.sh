@@ -26,7 +26,7 @@ trivy image -q --exit-code 1 --severity HIGH,CRITICAL "$image" \
   || { echo "HIGH or CRITICAL findings, or the scan failed: no bundle made."; exit 1; }
 
 echo "Packing $name ..."
-rm -rf "$out" && mkdir -p "$out/logs" "$out/kube" "$out/certs" "$out/scripts"
+rm -rf "$out" && mkdir -p "$out/logs" "$out/kube" "$out/certs" "$out/runbooks" "$out/scripts"
 docker save "$image" | xz -6 -T0 > "$out/image.tar.xz"
 # Live never builds. Dev's free online model must not stay active on prod.
 sed -e '/^    build: \.$/d' \

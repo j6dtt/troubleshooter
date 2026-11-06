@@ -5,11 +5,11 @@ import os
 import ssl
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from unittest import mock
 
-from troubleshooter import cli, engine, llm, tools
+from troubleshooter import cli, engine, learn, llm, tools
 from troubleshooter.config import Settings
 from troubleshooter.redact import clean, mask, strip_control
 from troubleshooter.run import run
@@ -397,6 +397,168 @@ esac""")
         with mock.patch.dict(os.environ, {"PATH": path}), redirect_stdout(out):
             cli.check_cluster(box, c, lambda *a: None)
         self.assertIn("1.34 and cluster 1.31", out.getvalue())
+
+
+class Runbooks(unittest.TestCase):
+    def tree(self, files):
+        d = tempfile.mkdtemp()
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+            with open(os.path.join(d, rel), "w") as f:
+                f.write(text)
+        return d
+
+    def test_picks_key_files_and_never_secrets(self):
+        d = self.tree({"compose.yaml": "x", "README.md": "x", "app/main.py": "x", ".env": "x", "tls.key": "x",
+                       "tests/test_a.py": "x", "backup/compose.yaml": "x", ".claude/notes.md": "x",
+                       "logs/a.log": "x", "package-lock.json": "x", "photo.png": "x"})
+        chosen, _, _ = learn.pick_files(d, 40)
+        self.assertEqual(sorted(chosen), ["README.md", "app/main.py", "compose.yaml"])
+
+    def test_docs_cannot_use_up_the_budget(self):
+        files = {f"docs/{i}.md": "x" for i in range(50)}
+        files.update({"compose.yaml": "x", "main.py": "x"})
+        chosen, left, _ = learn.pick_files(self.tree(files), 10)
+        self.assertIn("compose.yaml", chosen)
+        self.assertIn("main.py", chosen)
+        self.assertEqual(left, 42)
+
+    def test_invented_facts_are_dropped(self):
+        rows = ["import x", "PORT = 8080", "connect('db1:5432')"]
+        reply = ("PORT | 2 | PORT = 8080 | Listens on 8080.\n"
+                 "DEPENDS | 3 | connect to redis cluster | Needs Redis on port 6379.\n")
+        facts, dropped = learn.verify(reply, "a.py", rows)
+        self.assertEqual([f.text for f in facts], ["Listens on 8080."])
+        self.assertEqual(dropped, 1)
+
+    def test_wrong_line_number_is_corrected(self):
+        facts, _ = learn.verify("PORT | 1 | PORT = 8080 | Listens on 8080.", "a.py", ["import x", "", "PORT = 8080"])
+        self.assertEqual(facts[0].line, 3)
+
+    def test_chatter_and_unknown_topics_are_ignored(self):
+        facts, _ = learn.verify("Here are the facts:\nNONE\nWEATHER | 1 | import x y | It is sunny today.", "a", ["import x y"])
+        self.assertEqual(facts, [])
+
+    def test_line_numbers_survive_masking(self):
+        d = self.tree({"a.txt": "one\n-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\npassword=hunter2\nlast"})
+        rows = learn.load(os.path.join(d, "a.txt"))
+        self.assertEqual(rows[5], "last")
+        self.assertNotIn("AAAA", "\n".join(rows))
+        self.assertNotIn("hunter2", "\n".join(rows))
+
+    def test_a_long_line_in_a_document_is_kept(self):
+        d = self.tree({"a.md": "short\n" * 50 + "x" * 6000 + "\n"})
+        self.assertIsNotNone(learn.load(os.path.join(d, "a.md")))
+
+    def test_minified_file_is_skipped(self):
+        d = self.tree({"a.js": "x" * 6000})
+        self.assertIsNone(learn.load(os.path.join(d, "a.js")))
+
+    def test_learn_turns_thinking_off_and_reports_no_answer(self):
+        d = self.tree({"myapp/compose.yaml": "services:\n  web:\n    image: nginx\n", "myapp/main.py": "PORT = 8080\n"})
+        s = replace(Settings(), host_root=d, file_roots=("/myapp",), llm_url="http://x", llm_model="m",
+                    llm_reasoning="high", runbook_dir=d + "/none")
+        seen = []
+
+        def fake(settings, messages, tools=None):
+            seen.append(settings.llm_reasoning)
+            if "compose.yaml" in messages[-1]["content"]:
+                return {"content": ""}, "length"
+            if "main.py" in messages[-1]["content"]:
+                return {"content": "PORT | 1 | PORT = 8080 | Listens on 8080."}, "stop"
+            return {"content": "OVERVIEW: A web app [1]"}, "stop"
+        out = io.StringIO()
+        with mock.patch.object(llm, "chat", fake), mock.patch.object(llm, "context_tokens", lambda s: None), \
+                mock.patch.object(tools.Toolbox, "_docker_rows", lambda self: []), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(learn.main(s, ["/myapp"]), 0)
+        self.assertEqual(set(seen), {"off"})
+        self.assertIn("No answer for compose.yaml", out.getvalue())
+
+    def test_one_file_cannot_fill_a_section(self):
+        many = [learn.Fact("PORT", "big.md", i, f"Fact {i}") for i in range(1, 20)]
+        text = learn.render("a", "h", "/a", "m", many + [learn.Fact("PORT", "main.py", 5, "The real port")], [], [], [], [])
+        self.assertIn("The real port", text)
+
+    def test_app_code_comes_before_helper_scripts(self):
+        d = self.tree({"tools/probe.py": "raise X\n" * 50, "app/worker.py": "x = 1\n"})
+        chosen, _, _ = learn.pick_files(d, 1)
+        self.assertEqual(chosen, ["app/worker.py"])
+
+    def test_kubeconfig_is_not_sent(self):
+        d = self.tree({"a.yaml": "apiVersion: v1\nkind: Config\nusers: []\n"})
+        self.assertIsNone(learn.load(os.path.join(d, "a.yaml")))
+
+    def test_chunks_keep_every_line_once(self):
+        rows = [f"row {i}" for i in range(100)]
+        parts = learn.chunks(rows, 200)
+        self.assertGreater(len(parts), 1)
+        self.assertEqual(parts[0][0], 1)
+        self.assertEqual(parts[-1][1], 100)
+        self.assertTrue(all(a[1] + 1 == b[0] for a, b in zip(parts, parts[1:])))
+
+    def book(self, status="DRAFT", source="/apps/myapp"):
+        return f"# Runbook: myapp\n\nStatus: {status}\nHost: a\nSource: {source}\n"
+
+    def test_reviewed_runbook_is_not_replaced(self):
+        d = self.tree({"host-a/myapp.md": self.book("REVIEWED")})
+        s = replace(Settings(), runbook_dir=d)
+        self.assertIn("REVIEWED", learn.blocked(s, "host-a", "myapp", "/apps/myapp"))
+
+    def test_draft_is_replaced_and_other_hosts_are_separate(self):
+        d = self.tree({"host-a/myapp.md": self.book("REVIEWED"), "host-b/myapp.md": self.book()})
+        s = replace(Settings(), runbook_dir=d)
+        self.assertIsNone(learn.blocked(s, "host-b", "myapp", "/apps/myapp"))
+        self.assertIsNone(learn.blocked(s, "host-c", "myapp", "/apps/myapp"))
+
+    def test_same_name_from_another_folder_is_refused(self):
+        d = self.tree({"host-a/myapp.md": self.book(source="/apps2/myapp")})
+        s = replace(Settings(), runbook_dir=d)
+        self.assertIn("/apps2/myapp", learn.blocked(s, "host-a", "myapp", "/apps/myapp"))
+
+    def test_chat_is_told_a_draft_is_unconfirmed(self):
+        d = self.tree({"host-a/myapp.md": self.book(), "host-a/done.md": self.book("REVIEWED")})
+        box = tools.Toolbox(replace(Settings(), runbook_dir=d))
+        self.assertIn("UNCONFIRMED", box.read_runbook("myapp", "host-a"))
+        self.assertNotIn("UNCONFIRMED", box.read_runbook("done", "host-a"))
+        self.assertIn("host-a/myapp (DRAFT)", box.list_runbooks())
+
+    def test_this_hosts_runbooks_come_first(self):
+        d = self.tree({"aaa/x.md": self.book(), "here/x.md": self.book()})
+        box = tools.Toolbox(replace(Settings(), runbook_dir=d))
+        with mock.patch("socket.gethostname", return_value="here"):
+            self.assertEqual(box._runbooks()[0][0], "here")
+
+    def test_runbook_path_cannot_escape(self):
+        d = self.tree({"host-a/myapp.md": self.book()})
+        box = tools.Toolbox(replace(Settings(), runbook_dir=d))
+        for app, host in (("../../etc/passwd", "host-a"), ("myapp", "../..")):
+            with self.assertRaises(tools.BadInput):
+                box.read_runbook(app, host)
+
+    def test_nothing_on_stdout_but_the_runbook(self):
+        d = self.tree({"myapp/compose.yaml": "services:\n  web:\n    ports: ['8080:80']\n"})
+        s = replace(Settings(), host_root=d, file_roots=("/myapp",), llm_url="http://x", llm_model="m",
+                    runbook_dir=d + "/none")
+        replies = iter([({"content": "PORT | 3 | ports: ['8080:80'] | Web listens on 8080."}, "stop"),
+                        ({"content": "OVERVIEW: A web app [1]\nCHECK: Port 8080 [1]\nCHECK: Made up [99]"}, "stop")])
+        out = io.StringIO()
+        with mock.patch.object(llm, "chat", lambda *a, **k: next(replies)), \
+                mock.patch.object(llm, "context_tokens", lambda s: None), \
+                mock.patch.object(tools.Toolbox, "_docker_rows", lambda self: []), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(learn.main(s, ["/myapp"]), 0)
+        text = out.getvalue()
+        self.assertTrue(text.startswith("# Runbook: myapp"))
+        self.assertIn("Status: DRAFT", text)
+        self.assertIn("(compose.yaml:3)", text)
+        self.assertNotIn("Made up", text)
+
+    def test_outside_file_roots_is_refused(self):
+        d = self.tree({"etc/x.conf": "x"})
+        s = replace(Settings(), host_root=d, file_roots=("/apps",), llm_url="http://x", llm_model="m")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(learn.main(s, ["/etc"]), 2)
 
 
 if __name__ == "__main__":

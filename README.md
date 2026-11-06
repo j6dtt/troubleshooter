@@ -22,6 +22,14 @@ if you type `yes`. Piped input can never approve.
 
 Settings are in the block at the top of `compose.yaml`.
 Secrets go in `.env` (`LLM_API_KEY`, empty for vLLM).
+
+## Runbooks
+
+`./ts learn /apps/myapp` drafts `runbooks/<host>/myapp.md` from the app's
+source and what is running. Chat reads it when that app comes up. Each host
+has its own folder. Every fact names its file:line, and a fact whose quoted
+words aren't in the file is dropped. Review it, then change `Status: DRAFT`
+to `Status: REVIEWED`. See `./ts --help`.
 Log: `logs/<date>.log`, including every approval and refusal.
 
 ## Kubernetes and VKS

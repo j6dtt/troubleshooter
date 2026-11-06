@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-from . import __version__, config, llm
+from . import __version__, config, learn, llm
 from .engine import Session
 from .redact import strip_control
 from .run import run
@@ -117,7 +117,7 @@ def make_log(settings):
         except OSError as e:
             if not warned:
                 warned.append(True)
-                print(paint("31", f"! Cannot write the log in {settings.log_dir}: {e}. Actions are NOT being recorded."))
+                print(paint("31", f"! Cannot write the log in {settings.log_dir}: {e}. Actions are NOT being recorded."), file=sys.stderr)
     return write
 
 
@@ -254,6 +254,10 @@ def check(settings):
         check_cluster(box, c, report)
     report("Host files", os.path.isdir(settings.host_root + "/etc"), settings.host_root)
     report("Log folder", os.access(settings.log_dir, os.W_OK), settings.log_dir)
+    if os.path.isdir(settings.runbook_dir):
+        print(f"[ok] Runbooks: {len(box._runbooks())} found")
+    else:
+        print("[skip] Runbooks: no ./runbooks folder mounted")
     try:
         ids = llm.models(settings)
         window = llm.context_tokens(settings)
@@ -289,6 +293,8 @@ def main():
         return 0
     if command == "check":
         return check(settings)
+    if command == "learn":
+        return learn.main(settings, sys.argv[2:], make_log(settings))
     if command == "tools":
         list_tools(Toolbox(settings))
         return 0
@@ -298,7 +304,7 @@ def main():
         except ImportError:
             pass
         return chat(settings)
-    print("Usage: ./ts [chat|check|tools|--help]")
+    print("Usage: ./ts [chat|check|tools|learn /apps/myapp|--help]")
     return 2
 
 

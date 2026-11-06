@@ -6,3 +6,5 @@ kube/*
 !kube/.gitkeep
 certs/*
 !certs/.gitkeep
+runbooks/*
+!runbooks/.gitkeep
