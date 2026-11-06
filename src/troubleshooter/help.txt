@@ -1,0 +1,191 @@
+TROUBLESHOOTER
+
+Chat with an AI model that inspects Docker, Swarm, Kubernetes, this
+host and your app source code. It looks freely, and changes something
+only after you type yes. It never runs shell commands.
+
+START
+
+  docker compose up -d     start it (once)
+  ./ts check               test every connection
+  ./ts                     chat
+
+COMMANDS
+
+  ./ts                     chat
+  ./ts check               test Docker, contexts, logs, the model
+  ./ts tools               list every tool it can use
+  ./ts --help              this guide
+
+IN THE CHAT
+
+  /context                 list contexts (* = active)
+  /context NAME            switch context, this chat only
+  /paste                   paste many lines; finish with /end
+  /tools                   list every tool
+  /new                     forget this conversation
+  /help                    short list of these
+  /quit                    leave (Ctrl-D too)
+  Ctrl-C                   stop the current answer
+
+Follow-up questions keep the conversation going.
+
+WHAT TO ASK
+
+Whole system
+  What needs attention on this host?
+  Check every context and tell me what is broken.
+
+Containers
+  Why is web-1 unhealthy?
+  Why did worker-2 restart last night?
+  Was db-1 killed for running out of memory?
+  Can web-1 reach db-1 on port 5432?
+
+Docker engine
+  What storage and logging drivers is the engine using?
+  What is filling the Docker disk?
+  Which volumes does nothing use?
+  Which containers use the image python:3.13-slim?
+
+Swarm
+  Why is the service api short of replicas?
+  Which nodes are down?
+
+Kubernetes
+  Why is my pod stuck in Pending?
+  Why does api keep crashing? Check the previous run's logs.
+  Switch to vks-b and show me warnings from the last hour.
+
+Host
+  Why is the load high?
+  Has the kernel killed anything today?
+  Is anything listening on port 8080?
+  Is the VPN tunnel up?
+
+Applications and code
+  web-1 crashes at start. The source is in /apps/web. Find the bug.
+  Where is the setting db_timeout used in /apps/web?
+  This stack trace is from api. Which line is wrong? (use /paste)
+
+APPROVING A FIX
+
+For a change, it stops and shows:
+
+  == Approval needed ==
+  Action:  Restart container web-1
+  Why:     ...
+  Command: docker restart web-1
+  Type yes to run it, anything else to skip:
+
+Only yes runs it. Check the cluster name on Kubernetes fixes.
+Fixes it can make: restart, start and stop a container; restart and
+scale a Swarm service; delete a pod; restart and scale a Kubernetes
+workload.
+
+COMMANDS IT ASKS YOU TO RUN
+
+For anything its tools can't reach, it gives you commands to run
+yourself, then you paste the result back:
+
+  you> Is the firewall blocking port 443?
+  ...
+  sudo iptables -L -n | grep 443
+  Paste the output with /paste.
+
+  you> /paste
+  Paste now. Finish with a line saying /end
+  (paste the output)
+  /end
+
+Nothing checks these commands, and approval does not cover them.
+Read each one first. Any that changes something should start with
+"WARNING, changes the system:", but the model can get this wrong.
+
+KUBERNETES CONTEXTS
+
+It uses your kubectl login, so log in as usual first:
+
+  kubectl config use-context vks-a
+  ./ts
+
+The prompt shows the active context:
+
+  you [vks-a]> /context
+  * vks-a: ok
+    vks-b: the login was refused: the token has expired or is wrong.
+  you [vks-a]> /context vks-b
+  Active context is now vks-b. Your kubeconfig was not changed.
+
+You can also just ask: "switch to vks-b". Switching never changes
+your kubeconfig or other terminals. If a login expires, log in again
+in another terminal; the chat carries on. New contexts appear the
+next time you run ./ts.
+
+SOURCE CODE
+
+It can search and read code under the folders in file-roots, in
+compose.yaml (default /apps and /apps2). To add a folder:
+
+  1. add it to file-roots in compose.yaml
+  2. docker compose up -d
+
+It reads code but can't edit or run it. It shows a fix as a diff for
+you to apply. It skips .env, key files, links, .git and node_modules.
+
+SETTINGS
+
+In the block at the top of compose.yaml. After a change, run
+docker compose up -d. Secrets go in .env.
+
+  llm-url, llm-model   the model server, usually ending in /v1
+  llm-verify-tls       check the model server's certificate: true/false
+  llm-ca-file          private CA for that check, e.g. /certs/ca.pem
+  llm-reasoning        thinking: off, low, high, or empty
+  llm-max-tokens       largest reply
+  allow-changes        false = look only, the fix tools disappear
+  protected-names      never changed, even if approved
+  file-roots           folders it may read and search
+  max-steps            most model rounds for one question
+  max-seconds          most time for one question
+
+  LLM_API_KEY in .env  the model's key; empty for vLLM
+
+WHEN SOMETHING IS WRONG
+
+  Cannot reach the model server
+      Check llm-url in compose.yaml.
+  The model server refused access
+      Check LLM_API_KEY in .env, then docker compose up -d.
+  Not found (HTTP 404)
+      Check llm-url and llm-model.
+  The model server's certificate failed the check
+      Put its CA in ./certs and set llm-ca-file, or set llm-verify-tls
+      to "false".
+  The model server rejected tool calling
+      Turn on tool calling for the model on its server.
+  The login was refused
+      Log in again with kubectl.
+  Skip on Kubernetes in ./ts check
+      kubectl isn't working on this host, and ./kube is empty.
+  Answer cut off
+      Raise llm-max-tokens.
+  The conversation is too long
+      Type /new.
+  Not running, or "service is not running"
+      docker compose up -d
+
+FILES
+
+  logs/<date>.log    what happened, with every approval and decline
+  kube/              optional service-account logins, one per cluster
+  README.md          design and air-gapped install
+
+SAFETY
+
+  Passwords, keys and tokens are masked before the model, the screen
+  or a log sees them. This works by pattern, so it can miss some.
+  Kubernetes Secrets, .env and key files are never read.
+  Logs may hold hostile text; the model is told to treat it as data.
+  The model can be wrong. Check its evidence before you approve.
+  Anyone who can run ./ts has Docker admin rights.

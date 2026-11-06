@@ -1,0 +1,117 @@
+# ===================== SETTINGS =====================
+# Runtime image: bump the tag only when the Dockerfile
+# changes. Dev builds it; the air-gapped host loads it
+# from the bundle (scripts/make-bundle.sh), never builds.
+x-image: &image troubleshooter-runtime:2
+
+x-settings:
+  # --- The model (OpenAI-compatible). Keep ONE block. ---
+  # Dev: NVIDIA's free API. Tool output (masked) leaves
+  # this host and free tiers may train on prompts.
+  llm-url:   &llm-url https://integrate.api.nvidia.com/v1
+  # (3-super is listed but answers 404 on this key; Ultra
+  # takes ~60 s a reply and stalls: 3.5 Super answers in ~1 s.)
+  llm-model: &llm-model nvidia/nemotron-3.5-super-vl-120b-a12b
+  # Prod: Nemotron 3 Super on vLLM (no key).
+  # llm-url:   &llm-url http://<vllm-host>:8000/v1
+  # llm-model: &llm-model nvidia/nemotron-3-super-120b-a12b
+  # Prod: GPT-5.4 (LLM_API_KEY in .env).
+  # llm-url:   &llm-url https://<gpt-host>/v1
+  # llm-model: &llm-model gpt-5.4
+
+  # Thinking: off | low | high, empty = model's default.
+  llm-reasoning: &llm-reasoning ""
+  # Reply size. Reasoning models spend part of it thinking.
+  llm-max-tokens: &llm-max-tokens "8192"
+  # Check the model server's https certificate?
+  # "false" = no check, "true" = check it.
+  llm-verify-tls: &llm-verify-tls "false"
+  # With "true" and a private CA: put the CA in ./certs,
+  # then e.g. /certs/ca.pem. Empty = the usual public CAs.
+  llm-ca-file: &llm-ca-file ""
+
+  # --- What it may touch ---
+  # false = look only: the fix tools disappear.
+  allow-changes: &allow-changes "true"
+  # Containers, pods and namespaces never changed, even
+  # if approved. Comma list; a trailing * is a prefix.
+  protected-names: &protected-names "troubleshooter,kube-system,kube-public,kube-node-lease,tkg-system,vmware-system-*"
+  # Host folders it may read and search, including your
+  # source code (.env, keys never). Then: docker compose up -d
+  file-roots: &file-roots "/apps,/apps2"
+
+  # --- Limits ---
+  # Most model rounds for one question, and most time;
+  # past either it stops and summarises what it found.
+  max-steps: &max-steps "15"
+  max-seconds: &max-seconds "900"
+  # Wait this long for one model reply before retrying.
+  llm-timeout: &llm-timeout "180"
+  # Conversation size before old tool output is dropped.
+  max-context-chars: &max-context-chars "200000"
+  # Most characters kept from one tool's output.
+  tool-output-chars: &tool-output-chars "12000"
+
+  # --- Kubernetes ---
+  # No setting: one kubeconfig per cluster in ./kube,
+  # named after the cluster. Make them with
+  # scripts/make-kubeconfig.sh. Empty = no Kubernetes.
+
+# Start:  docker compose up -d
+# Test:   ./ts check
+# Chat:   ./ts
+# Help:   ./ts --help
+# Code fix: edit ./src, run ./ts again.
+# ====================================================
+
+services:
+  troubleshooter:
+    build: .
+    image: *image
+    pull_policy: never
+    container_name: troubleshooter
+    restart: unless-stopped
+    init: true
+    # Host views: same network and processes as the host,
+    # so ports, kube API and "ps" are the host's. This only
+    # affects this container; the host itself is unchanged.
+    network_mode: host
+    pid: host
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    # SYS_CHROOT: to run the host's own journalctl, read-only.
+    cap_add: [DAC_OVERRIDE, SYS_CHROOT]
+    # label=disable: on SELinux hosts the Docker socket and
+    # host folders are otherwise refused. No effect elsewhere.
+    security_opt: ["no-new-privileges:true", "label=disable"]
+    mem_limit: 512m
+    cpus: 1
+    # Plain form on purpose: Compose before 2.24 rejects
+    # the path/required form. .env must exist (may be empty).
+    env_file:
+      - .env
+    environment:
+      HELPER_IMAGE: *image
+      LLM_URL: *llm-url
+      LLM_MODEL: *llm-model
+      LLM_REASONING: *llm-reasoning
+      LLM_VERIFY_TLS: *llm-verify-tls
+      LLM_CA_FILE: *llm-ca-file
+      LLM_MAX_TOKENS: *llm-max-tokens
+      ALLOW_CHANGES: *allow-changes
+      PROTECTED_NAMES: *protected-names
+      FILE_ROOTS: *file-roots
+      MAX_STEPS_PER_QUESTION: *max-steps
+      MAX_SECONDS_PER_QUESTION: *max-seconds
+      LLM_TIMEOUT_SECONDS: *llm-timeout
+      PYTHONUNBUFFERED: "1"
+      MAX_CONTEXT_CHARS: *max-context-chars
+      TOOL_OUTPUT_CHARS: *tool-output-chars
+    volumes:
+      - ./src:/app/src:ro
+      - ./logs:/logs
+      - ./kube:/kube:ro
+      - ./certs:/certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /:/host:ro,rslave

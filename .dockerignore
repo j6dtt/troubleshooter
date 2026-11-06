@@ -1,0 +1,5 @@
+dist
+logs
+.env
+tests
+kube

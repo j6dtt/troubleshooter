@@ -1,0 +1,8 @@
+.env
+logs/
+dist/
+__pycache__/
+kube/*
+!kube/.gitkeep
+certs/*
+!certs/.gitkeep
