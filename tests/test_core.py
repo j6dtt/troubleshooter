@@ -399,6 +399,30 @@ esac""")
         self.assertIn("1.34 and cluster 1.31", out.getvalue())
 
 
+class Launcher(unittest.TestCase):
+    """Runs on the host with its own python3, which may be as old as 3.6."""
+
+    def test_parses_as_python_36(self):
+        import ast
+        path = os.path.join(os.path.dirname(learn.__file__), "launcher.py")
+        with open(path) as f:
+            ast.parse(f.read(), feature_version=(3, 6))
+
+    def test_names_match_the_container(self):
+        from troubleshooter import launcher
+        for raw in ("myapp", "my app", "x.y_z", "ünï"):
+            self.assertEqual(launcher.safe(raw), learn.app_name("/apps/" + raw))
+
+    def test_reads_the_proxy_port(self):
+        from troubleshooter import launcher
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "0")
+        with open(log, "w") as f:
+            f.write("Starting to serve on 127.0.0.1:45991\n")
+        alive = mock.Mock(poll=lambda: None)
+        self.assertEqual(launcher.Proxies._port(alive, log), "45991")
+
+
 class Runbooks(unittest.TestCase):
     def tree(self, files):
         d = tempfile.mkdtemp()

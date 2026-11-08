@@ -9,6 +9,10 @@ the host and app files, and fix things once you approve.
 
 Full guide with examples: `./ts --help`.
 
+`./ts` is two lines that start `src/troubleshooter/launcher.py` with the
+host's `python3` (3.6 or newer). Everything is in `src/`, so an update is
+`.py` files and `help.txt`, never `./ts` itself.
+
 ## Use
 
     docker compose up -d

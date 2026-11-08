@@ -53,7 +53,9 @@ Troubleshooter $version: install on the air-gapped host (no internet needed)
   ./ts check           # every line must say ok
   ./ts                 # chat
 
+Needs on the host: Docker with compose, and python3 (3.6 or newer) for ./ts.
 Update: load the new image if its tag changed, replace src/, run ./ts.
+./ts never changes: it hands over to src/troubleshooter/launcher.py.
 EOF
 tar -C dist -cf "dist/$name.tar" "$name"
 rm -rf "$out"
