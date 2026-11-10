@@ -351,7 +351,40 @@ class Retry(unittest.TestCase):
         body = llm._body(Settings(llm_model="gpt-5.4", llm_reasoning="off"), [], None)
         self.assertIn("max_completion_tokens", body)
         self.assertNotIn("max_tokens", body)
+        self.assertEqual(body["reasoning_effort"], "none")  # gpt-5.4 refuses "minimal"
+
+    def test_first_gpt5_still_says_minimal(self):
+        body = llm._body(Settings(llm_model="gpt-5", llm_reasoning="off"), [], None)
         self.assertEqual(body["reasoning_effort"], "minimal")
+
+    def test_404_says_where_and_what_the_server_said(self):
+        s = Settings(llm_url="https://gw/v1", llm_model="gpt-5.4")
+        text = llm._explain(404, '{"error": {"message": "The model gpt-5.4 does not exist"}}', s, "/chat/completions")
+        self.assertIn("https://gw/v1/chat/completions", text)
+        self.assertIn("does not exist", text)
+
+    def test_server_reason_is_masked(self):
+        text = llm._explain(401, '{"error": "bad api_key=sk-abcdefghijklmnopqrstuvwxyz"}', Settings())
+        self.assertNotIn("abcdefghijklmnop", text)
+
+    def test_reasoning_refusal_says_which_setting(self):
+        s = Settings(llm_model="gpt-5.4", llm_reasoning="high")
+        detail = '{"error": {"message": "Function tools with reasoning_effort are not supported for gpt-5.4"}}'
+        self.assertIn("Leave llm-reasoning empty", llm._explain(400, detail, s))
+
+    def test_check_goes_on_when_the_model_list_is_missing(self):
+        def missing(s):
+            err = llm.LLMError("Not found")
+            err.code = 404
+            raise err
+        called = {"overview": True}
+        out = io.StringIO()
+        with mock.patch.object(llm, "models", missing), mock.patch.object(llm, "context_tokens", lambda s: None), \
+                mock.patch.object(llm, "chat", lambda *a, **k: ({"tool_calls": [called]}, "tool_calls")), \
+                redirect_stdout(out):
+            cli.check(Settings(llm_url="https://gw/v1", llm_model="gpt-5.4"))
+        self.assertIn("[warn] Model list", out.getvalue())
+        self.assertIn("[ok] Tool calling", out.getvalue())
 
 
 class KubectlWarnings(unittest.TestCase):

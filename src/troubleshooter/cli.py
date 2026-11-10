@@ -263,10 +263,13 @@ def check(settings):
         window = llm.context_tokens(settings)
         report("Model server", True, settings.llm_url + (f" ({window} token window)" if window else ""))
         if ids and settings.llm_model not in ids:
-            report("Model name", False, f"{settings.llm_model} is not served here")
+            report("Model name", False, f"{settings.llm_model} is not served here. It serves: {', '.join(ids[:8])}")
     except llm.LLMError as e:
-        report("Model server", False, str(e))
-        return 1
+        if e.code != 404:
+            report("Model server", False, str(e))
+            return 1
+        # Gateways in front of hosted models often don't offer the list. The chat below is the real test.
+        print(f"[warn] Model list: not offered at {settings.llm_url}/models. Testing a chat instead.")
     try:
         tool = [{"type": "function", "function": {
             "name": "overview", "description": "Health of the system.",

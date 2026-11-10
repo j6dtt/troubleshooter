@@ -6,11 +6,14 @@ import time
 import urllib.error
 import urllib.request
 
+from .redact import mask, strip_control
+
 _THINK = re.compile(r"<think>.*?(</think>|\Z)", re.S)
 
 
 class LLMError(Exception):
-    """A model server problem, worded for the person at the terminal."""
+    """A model server problem, worded for the person at the terminal. code: the HTTP status, if any."""
+    code = None
 
 
 class Busy(LLMError):
@@ -79,10 +82,13 @@ def _request(s, path, body=None):
     try:
         return urllib.request.urlopen(req, timeout=s.llm_timeout, context=_ssl_context(s))
     except urllib.error.HTTPError as e:
-        detail = e.read(600).decode("utf-8", "replace")
+        detail = e.read(2000).decode("utf-8", "replace")
         if e.code in (429, 500, 502, 503, 504):
-            raise Busy(_explain(e.code, detail, s), e.headers.get("Retry-After")) from None
-        raise LLMError(_explain(e.code, detail, s)) from None
+            err = Busy(_explain(e.code, detail, s, path), e.headers.get("Retry-After"))
+        else:
+            err = LLMError(_explain(e.code, detail, s, path))
+        err.code = e.code
+        raise err from None
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         reason = getattr(e, "reason", e)
         if isinstance(reason, ssl.SSLCertVerificationError):
@@ -93,11 +99,27 @@ def _request(s, path, body=None):
         raise LLMError(f"Cannot reach the model server at {s.llm_url}: {reason}") from None
 
 
-def _explain(code, detail, s):
+def _reason(detail):
+    """The server's own words: they usually say exactly what is wrong."""
+    try:
+        err = json.loads(detail).get("error")
+        text = err.get("message") if isinstance(err, dict) else err
+    except (ValueError, AttributeError):
+        text = None
+    text = re.sub(r"\s+", " ", strip_control(str(text or detail))).strip()
+    return mask(text)[:300] or "nothing"
+
+
+def _explain(code, detail, s, path=""):
+    said = _reason(detail)
     if code in (401, 403):
-        return f"The model server refused access (HTTP {code}). Check LLM_API_KEY in .env."
+        return f"The model server refused access (HTTP {code}). Check LLM_API_KEY in .env. Server said: {said}"
     if code == 404:
-        return f"Not found (HTTP 404). Check LLM_URL ({s.llm_url}, usually ends in /v1) and LLM_MODEL ({s.llm_model})."
+        return (f"Not found (HTTP 404) at {s.llm_url}{path}. Server said: {said}. "
+                f"Check llm-url (usually ends in /v1) and llm-model ({s.llm_model}).")
+    if code == 400 and "reasoning" in detail.lower():
+        return (f"The model server refused the thinking setting (llm-reasoning: {s.llm_reasoning or 'empty'}). "
+                f"Leave llm-reasoning empty. Server said: {said}")
     if code == 400 and "tool" in detail.lower():
         return ("The model server rejected tool calling (HTTP 400). Tool calling must be switched on "
                 f"for this model on the server. Server said: {detail[:200]}")
@@ -161,7 +183,9 @@ def _body(s, messages, tools):
     body["max_completion_tokens" if gpt else "max_tokens"] = s.llm_max_tokens
     if s.llm_reasoning in ("off", "low", "high"):
         if gpt:
-            body["reasoning_effort"] = {"off": "minimal"}.get(s.llm_reasoning, s.llm_reasoning)
+            # gpt-5 calls "off" minimal; gpt-5.1 and later call it none and refuse minimal.
+            off = "none" if re.search(r"gpt-5\.\d", s.llm_model) else "minimal"
+            body["reasoning_effort"] = {"off": off}.get(s.llm_reasoning, s.llm_reasoning)
         else:
             body["chat_template_kwargs"] = {"enable_thinking": s.llm_reasoning != "off"}
     if tools:
