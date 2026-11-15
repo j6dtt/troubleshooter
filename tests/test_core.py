@@ -10,7 +10,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from unittest import mock
 
-from troubleshooter import cli, engine, history, learn, llm, tools, watch
+from troubleshooter import cases, cli, config, engine, history, launcher, learn, llm, tools, watch
 from troubleshooter.config import Settings
 from troubleshooter.redact import clean, mask, strip_control
 from troubleshooter.run import run
@@ -247,9 +247,9 @@ class UI:
         return self.answer
 
 
-def call(name, **args):
+def call(tool, **args):
     return {"role": "assistant", "content": "", "tool_calls": [
-        {"id": "1", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}
+        {"id": "1", "type": "function", "function": {"name": tool, "arguments": json.dumps(args)}}]}
 
 
 
@@ -923,7 +923,7 @@ class Report(unittest.TestCase):
         ui.spinner, ui.done = mock.Mock(), lambda: None
         sess = engine.Session(s, ui)
         self.assertIsNone(sess.report())
-        self.assertIn("Nothing to report yet", ui.notices[0])
+        self.assertIn("Nothing to write up yet", ui.notices[0])
         sess.messages += [{"role": "user", "content": "why is relay down?"}, call("docker_list"),
                           {"role": "tool", "tool_call_id": "1", "content": "relay Exited (1)"},
                           {"role": "assistant", "content": "It exited."}]
@@ -943,6 +943,208 @@ class Report(unittest.TestCase):
             text = f.read()
         self.assertIn("SUMMARY\nrelay exited.", text)
         self.assertIn("Check it before passing it on", text)
+
+
+NOTE = """TITLE: web pods crash after rollout: missing PAYMENT_URL
+SYMPTOM
+Pods of deployment shop/web in CrashLoopBackOff. Log: FATAL: missing required setting PAYMENT_URL
+CAUSE
+Image 1.3 needs PAYMENT_URL; the configmap did not have it. password=hunter2hunter2
+FIX
+Added PAYMENT_URL to configmap web-config and restarted. Confirmed.
+CHECK
+k8s_workload_logs on deployment web, match FATAL
+WORDS: web shop CrashLoopBackOff PAYMENT_URL configmap rollout"""
+
+
+class Cases(unittest.TestCase):
+    def setUp(self):
+        base = tempfile.mkdtemp()
+        self.s = Settings(llm_url="http://x", llm_model="m", kube_dir="/none",
+                          log_dir=os.path.join(base, "logs"), runbook_dir=os.path.join(base, "runbooks"))
+        os.makedirs(self.s.log_dir)
+        os.makedirs(self.s.runbook_dir)
+
+    def share(self):
+        """What ./ts does on the host after a chat."""
+        for key, text in cases.waiting(self.s).items():
+            host, name = key.split("/")
+            os.makedirs(os.path.join(self.s.runbook_dir, "_cases", host), exist_ok=True)
+            with open(os.path.join(self.s.runbook_dir, "_cases", host, name), "w") as f:
+                f.write(text)
+        cases.sent(self.s, list(cases.waiting(self.s)) or [f"{h}/{n}" for h, n, _ in cases.all_cases(self.s)])
+
+    def test_saved_case_is_found_by_its_words_and_masked(self):
+        name = cases.save(self.s, NOTE, "work")
+        self.assertRegex(name, r"^\d{8}-\d{6}-web-pods-crash-after-rollout-missing-payment-url\.md$")
+        out = cases.search(self.s, "PAYMENT_URL crashloopbackoff")
+        self.assertIn("Each is a lead, not proof", out)
+        self.assertIn("# web pods crash after rollout: missing PAYMENT_URL", out)
+        self.assertIn("context work", out)
+        self.assertNotIn("hunter2", out)
+        self.assertIn("None of the 1 saved cases", cases.search(self.s, "postgres"))
+        self.assertIn("- web pods crash after rollout: missing PAYMENT_URL", cases.search(self.s, ""))
+
+    def test_best_match_first_and_only_a_few_in_full(self):
+        for n in range(5):
+            cases.save(self.s, f"TITLE: disk full on node {n}\nSYMPTOM\nno space left on device\nWORDS: disk node", "")
+            os.rename(os.path.join(self.s.log_dir, "cases", os.listdir(os.path.join(self.s.log_dir, "cases"))[0],
+                                   sorted(os.listdir(os.path.join(self.s.log_dir, "cases", os.listdir(os.path.join(self.s.log_dir, "cases"))[0])))[-1]),
+                      os.path.join(self.s.log_dir, "cases", os.listdir(os.path.join(self.s.log_dir, "cases"))[0], f"2026010{n}-000000-disk-{n}.md"))
+        cases.save(self.s, NOTE, "")
+        out = cases.search(self.s, "PAYMENT_URL disk")
+        self.assertEqual(out.count("--- case from host"), 3)
+        self.assertIn("Also matching: ", out)
+        self.assertLess(out.index("disk full on node 4"), out.index("disk full on node 3"))
+
+    def test_copied_to_the_shared_folder_once_and_then_read_from_there(self):
+        name = cases.save(self.s, NOTE, "")
+        host = os.listdir(os.path.join(self.s.log_dir, "cases"))[0]
+        self.assertEqual(list(cases.waiting(self.s)), [f"{host}/{name}"])
+        self.share()
+        self.assertEqual(cases.waiting(self.s), {})
+        self.assertEqual(os.listdir(os.path.join(self.s.log_dir, "cases", host)), [])
+        self.assertEqual(len(cases.all_cases(self.s)), 1)
+        os.unlink(os.path.join(self.s.runbook_dir, "_cases", host, name))  # the operator deletes a case
+        self.assertEqual(cases.all_cases(self.s), [])                      # ... and it does not come back
+
+    def test_local_copy_is_kept_until_the_shared_one_exists(self):
+        name = cases.save(self.s, NOTE, "")
+        host = os.listdir(os.path.join(self.s.log_dir, "cases"))[0]
+        cases.sent(self.s, [f"{host}/{name}", "../../etc/passwd", "x"])
+        self.assertEqual(len(cases.all_cases(self.s)), 1)
+
+    def test_cases_are_not_runbooks_and_other_files_are_ignored(self):
+        cases.save(self.s, NOTE, "")
+        self.share()
+        folder = os.path.join(self.s.runbook_dir, "_cases", os.listdir(os.path.join(self.s.runbook_dir, "_cases"))[0])
+        for bad in (".hidden.md", "notes.txt"):
+            with open(os.path.join(folder, bad), "w") as f:
+                f.write("x")
+        box = tools.Toolbox(self.s, clusters={})
+        self.assertEqual(box._runbooks(), [])
+        self.assertEqual(len(cases.all_cases(self.s)), 1)
+        self.assertIn("PAYMENT_URL", box.tools["past_cases"].fn(words="payment_url"))
+
+    def test_chat_is_told_about_cases_only_when_there_are_some(self):
+        sess = engine.Session(self.s, UI())
+        self.assertNotIn("past_cases", sess.messages[0]["content"])
+        self.assertIn("/case", sess.messages[0]["content"])
+        cases.save(self.s, NOTE, "")
+        sess.reset()
+        self.assertIn("1 past cases are saved", sess.messages[0]["content"])
+
+    def run_case(self, answer):
+        ui = UI()
+        ui.spinner, ui.done = mock.Mock(), lambda: None
+        sess = engine.Session(self.s, ui)
+        sess.messages += [{"role": "user", "content": "why is web down?"}, call("docker_list"),
+                          {"role": "tool", "tool_call_id": "1", "content": "x"}, {"role": "assistant", "content": "y"}]
+        out, logged = io.StringIO(), []
+        with mock.patch.object(llm, "chat", lambda *a, **k: ({"role": "assistant", "content": NOTE}, "stop")), \
+                mock.patch("builtins.input", lambda prompt: answer), redirect_stdout(out):
+            cli.case(self.s, sess, ui, logged.append)
+        return out.getvalue(), logged
+
+    def test_case_command_saves_only_on_yes(self):
+        out, logged = self.run_case("no")
+        self.assertIn("Not saved.", out)
+        self.assertEqual(cases.all_cases(self.s), [])
+        out, logged = self.run_case("yes")
+        self.assertIn("Saved: web pods crash after rollout: missing PAYMENT_URL", out)
+        self.assertEqual(len(cases.all_cases(self.s)), 1)
+        self.assertTrue(logged[0].startswith("You saved a case: "))
+
+    def test_launcher_writes_cases_to_the_shared_folder(self):
+        home, calls = tempfile.mkdtemp(), []
+        found = {"host-a/20261115-000000-web.md": "# web\ntext", "../x/evil.md": "bad", "host-a/.hid.md": "bad",
+                 "host-a/a b.md": "bad", "host-a/notes.txt": "bad"}
+
+        def quiet(argv):
+            calls.append(argv)
+            return "" if "--sent" in argv else json.dumps(found)
+        out, here = io.StringIO(), os.getcwd()
+        os.chdir(home)
+        try:
+            with mock.patch.object(launcher, "quiet", quiet), redirect_stdout(out):
+                launcher.share_cases()
+        finally:
+            os.chdir(here)
+        self.assertEqual(os.listdir(os.path.join(home, "runbooks", "_cases")), ["host-a"])
+        self.assertEqual(os.listdir(os.path.join(home, "runbooks", "_cases", "host-a")), ["20261115-000000-web.md"])
+        self.assertEqual(calls[-1][-2:], ["--sent", "host-a/20261115-000000-web.md"])
+        self.assertIn("Saved 1 case(s) for every host", out.getvalue())
+        self.assertEqual(os.stat(os.path.join(home, "runbooks", "_cases", "host-a", "20261115-000000-web.md")).st_mode & 0o777, 0o644)
+
+
+class LearnModel(unittest.TestCase):
+    CHAT = dict(llm_url="https://gpt.example/v1", llm_model="gpt-5.4", llm_api_key="chat-key")
+
+    def test_same_as_chat_when_not_set(self):
+        s = Settings(**self.CHAT)
+        self.assertIs(config.for_learning(s), s)
+
+    def test_other_server_never_gets_the_chat_key(self):
+        got = config.for_learning(Settings(**self.CHAT, learn_llm_url="http://vllm.example/v1", learn_llm_model="nemotron"))
+        self.assertEqual((got.llm_url, got.llm_model, got.llm_api_key), ("http://vllm.example/v1", "nemotron", ""))
+        got = config.for_learning(Settings(**self.CHAT, learn_llm_url="http://vllm.example/v1", learn_llm_model="nemotron",
+                                           learn_llm_api_key="learn-key"))
+        self.assertEqual(got.llm_api_key, "learn-key")
+
+    def test_other_model_on_the_same_server_keeps_the_key(self):
+        got = config.for_learning(Settings(**self.CHAT, learn_llm_model="gpt-5.4-mini"))
+        self.assertEqual((got.llm_url, got.llm_model, got.llm_api_key), ("https://gpt.example/v1", "gpt-5.4-mini", "chat-key"))
+
+    def test_learn_talks_to_the_learn_model(self):
+        seen = {}
+
+        def fake(settings, argv, log):
+            seen["model"], seen["reasoning"] = settings.llm_model, settings.llm_reasoning
+            return 0
+        with mock.patch.object(learn, "_learn", fake):
+            learn.main(Settings(**self.CHAT, learn_llm_model="nemotron"), ["/apps/x"], lambda line: None)
+        self.assertEqual(seen, {"model": "nemotron", "reasoning": "off"})
+
+
+class SupervisorIsNotChanged(unittest.TestCase):
+    def test_fix_tools_refuse_a_supervisor(self):
+        box = tools.Toolbox(Settings(), clusters={"work": tools.Cluster("work", "", "work"), "super": tools.Cluster("super", "", "super")})
+        box.roles = {"work": "workload", "super": "supervisor"}
+        for change in (lambda c: box.k8s_delete_pod(c, "web-1", "shop"), lambda c: box.k8s_restart(c, "deployments", "web", "shop"),
+                       lambda c: box.k8s_scale(c, "deployments", "web", "shop", 3)):
+            self.assertIsInstance(change("work"), tools.Change)
+            with self.assertRaises(tools.BadInput) as e:
+                change("super")
+            self.assertIn("nothing there is changed from here", str(e.exception))
+
+    def test_refusal_reaches_the_model_and_nothing_is_asked(self):
+        ui = UI(approve=True)
+        sess = engine.Session(Settings(llm_url="http://x", llm_model="m", kube_dir="/none"), ui,
+                              toolbox=tools.Toolbox(Settings(), clusters={"super": tools.Cluster("super", "", "super")}))
+        sess.box.roles = {"super": "supervisor"}
+        text = sess._run_one(call("k8s_restart", **{"kind": "deployments", "name": "web", "namespace": "shop", "reason": "it is stuck"})["tool_calls"][0], {})
+        self.assertIn("Refused: super is a VMware Supervisor", text)
+        self.assertEqual(ui.asked, [])
+
+
+class Recorder(unittest.TestCase):
+    def test_records_on_its_timer_and_can_be_turned_off(self):
+        taken, slept, out = [], [], io.StringIO()
+        with mock.patch.object(history, "record", taken.append), redirect_stdout(out):
+            history.record_forever("box", 5, sleep=slept.append, rounds=3)
+            history.record_forever("box", 0, sleep=slept.append, rounds=3)
+        self.assertEqual((taken, slept), (["box"] * 3, [300] * 3))
+        self.assertIn("Background recording is off", out.getvalue())
+
+    def test_snapshot_without_a_login_keeps_the_clusters_last_state(self):
+        s = Settings(log_dir=tempfile.mkdtemp())
+        history.save(s, snapshot(1000))
+        no_login = {"time": 1300, "docker": snapshot(1300)["docker"], "k8s": {}}
+        self.assertFalse(history.save(s, no_login))            # not a change: nothing new was seen
+        self.assertFalse(history.save(s, snapshot(1600)))      # the chat comes back: still the same
+        self.assertEqual(len(os.listdir(history.folder(s))), 1)
+        got, _ = history.before(s, 2000)
+        self.assertIn("a", got["k8s"])
 
 
 class Launcher(unittest.TestCase):

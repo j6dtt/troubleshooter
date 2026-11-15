@@ -54,6 +54,14 @@ x-settings:
   # ./ts learn: most files to read, and most time, per app.
   learn-max-files: &learn-max-files "40"
   learn-minutes: &learn-minutes "30"
+  # ./ts learn can use another model than the chat, e.g. chat on
+  # GPT and learn on the local model. Empty = same as the chat.
+  # A key for it, if it needs one: LEARN_LLM_API_KEY in .env.
+  learn-llm-url:   &learn-llm-url ""
+  learn-llm-model: &learn-llm-model ""
+  # Minutes between background snapshots of Docker, for
+  # "what changed". Runs with no chat open. "0" turns it off.
+  record-minutes: &record-minutes "5"
 
   # --- Kubernetes ---
   # No setting: one kubeconfig per cluster in ./kube,
@@ -113,6 +121,12 @@ services:
       TOOL_OUTPUT_CHARS: *tool-output-chars
       LEARN_MAX_FILES: *learn-max-files
       LEARN_MINUTES: *learn-minutes
+      LEARN_LLM_URL: *learn-llm-url
+      LEARN_LLM_MODEL: *learn-llm-model
+      RECORD_MINUTES: *record-minutes
+    # Records in the background. If that ever stops, the container
+    # stays up so ./ts keeps working.
+    command: ["sh", "-c", "ts record; exec sleep infinity"]
     volumes:
       - ./src:/app/src:ro
       - ./logs:/logs

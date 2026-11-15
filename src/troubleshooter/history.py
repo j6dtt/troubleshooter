@@ -193,7 +193,9 @@ def _merge(last, snap):
     """A part that could not be read this time keeps its last known state, so an expired login is not a change."""
     if not last:
         return snap
-    kube = {cid: part if part is not None else (last.get("k8s") or {}).get(cid) for cid, part in snap["k8s"].items()}
+    known = last.get("k8s") or {}
+    # A context this snapshot does not cover (taken with no login open) keeps its last known state too.
+    kube = {**known, **{cid: part if part is not None else known.get(cid) for cid, part in snap["k8s"].items()}}
     return {"time": snap["time"], "docker": snap["docker"] if snap["docker"] is not None else last.get("docker"), "k8s": kube}
 
 
@@ -413,3 +415,17 @@ def what_changed(box, since_seconds):
         text += [f"- {clock(w)[11:]} {n} ({c.get('image')})" for w, n, c in started[-30:]]
     return "\n".join(text)
 
+
+
+def record_forever(box, minutes, sleep=time.sleep, rounds=None):
+    """The container's own job: snapshots with no chat open. It sees Docker, and clusters that have a
+    kubeconfig file in ./kube; your own kubectl login is only there while ./ts runs."""
+    if minutes <= 0:
+        print("Background recording is off (record-minutes is 0).", flush=True)
+        return
+    print(f"Recording what is deployed every {minutes} minutes, for what_changed.", flush=True)
+    done = 0
+    while rounds is None or done < rounds:
+        record(box)
+        done += 1
+        sleep(minutes * 60)

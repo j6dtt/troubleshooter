@@ -1233,7 +1233,7 @@ class Toolbox:
         """(host, app, status) of every runbook, this host's first."""
         here, found = socket.gethostname(), []
         try:
-            hosts = sorted(e.name for e in os.scandir(self.s.runbook_dir) if e.is_dir())
+            hosts = sorted(e.name for e in os.scandir(self.s.runbook_dir) if e.is_dir() and not e.name.startswith("_"))
             for host in sorted(hosts, key=lambda h: h != here):
                 for e in sorted(os.scandir(os.path.join(self.s.runbook_dir, host)), key=lambda e: e.name):
                     if e.name.endswith(".md") and not e.name.startswith("."):
@@ -1267,6 +1267,10 @@ class Toolbox:
         more = f"\n[Lines {start}-{stop} of {len(rows)}. Use start_line={stop + 1} for more.]" if stop < len(rows) else ""
         return f"{head}\n{body}{more}"
 
+    def past_cases(self, words):
+        from . import cases
+        return cases.search(self.s, words)
+
     # ---------- Changes: each returns a Change; the engine asks before running it ----------
     def docker_restart(self, container):
         c = self._guard(name(container, "container"))
@@ -1288,18 +1292,26 @@ class Toolbox:
         v = self._guard(name(service, "service"))
         return Change(f"Scale Swarm service {v} to {replicas}", ["docker", "service", "scale", "--detach", f"{v}={replicas}"])
 
+    def _changeable(self, cluster):
+        """Nothing is changed on a Supervisor: VMware manages what is there."""
+        c = self._cluster(cluster)
+        if self._role(c.id) == "supervisor":
+            raise BadInput(f"{c.id} is a VMware Supervisor, and nothing there is changed from here. "
+                           "If something there must change, tell the operator what, and that it is done in vCenter.")
+        return c
+
     def k8s_delete_pod(self, cluster, pod, namespace):
-        p, n, c = self._guard(name(pod, "pod")), self._guard(self._ns1(cluster, namespace)), self._cluster(cluster)
+        p, n, c = self._guard(name(pod, "pod")), self._guard(self._ns1(cluster, namespace)), self._changeable(cluster)
         return Change(f"On cluster {c.id}: delete pod {n}/{p} (its controller makes a new one)",
                       self._kubectl(c.id, "delete", "pod", p, "-n", n, "--wait=false"))
 
     def k8s_restart(self, cluster, kind, resource, namespace):
-        r, n, c = self._guard(name(resource, "resource")), self._guard(self._ns1(cluster, namespace)), self._cluster(cluster)
+        r, n, c = self._guard(name(resource, "resource")), self._guard(self._ns1(cluster, namespace)), self._changeable(cluster)
         return Change(f"On cluster {c.id}: rolling restart of {kind} {n}/{r}",
                       self._kubectl(c.id, "rollout", "restart", f"{kind}/{r}", "-n", n))
 
     def k8s_scale(self, cluster, kind, resource, namespace, replicas):
-        r, n, c = self._guard(name(resource, "resource")), self._guard(self._ns1(cluster, namespace)), self._cluster(cluster)
+        r, n, c = self._guard(name(resource, "resource")), self._guard(self._ns1(cluster, namespace)), self._changeable(cluster)
         return Change(f"On cluster {c.id}: scale {kind} {n}/{r} to {replicas}",
                       self._kubectl(c.id, "scale", f"{kind}/{r}", f"--replicas={replicas}", "-n", n))
 
@@ -1448,6 +1460,10 @@ class Toolbox:
               "Read runbook {app}", self.read_runbook,
               {"app": P("string", "App name", True), "host": P("string", "Host (default: this host)"),
                "start_line": P("integer", "First line (default 1)")}),
+            t("past_cases", "Notes on problems solved before, on this and other hosts: symptom, cause, fix and how to "
+              "confirm. Search with the error text and the app or resource name. Without words: the list of cases.",
+              "Looked for past cases about {words}", self.past_cases,
+              {"words": P("string", "Words to look for, separated by spaces or |")}),
             t("docker_restart", "Restart a container. Asks the operator first.", "Restart container {container}",
               reasoned(self.docker_restart), {"container": cont, "reason": reason}, change=True),
             t("docker_start", "Start a stopped container. Asks the operator first.", "Start container {container}",

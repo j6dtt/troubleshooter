@@ -24,6 +24,7 @@ IN THE CHAT
   /context NAME            switch context, this chat only
   /paste                   paste many lines; finish with /end
   /report                  write this chat up as an incident report
+  /case                    save this problem and its fix for later
   /tools                   list every tool
   /new                     forget this conversation
   /help                    short list of these
@@ -141,8 +142,10 @@ machines and VMs. Ask "what changed in the last 2 hours?" and it
 compares then with now, and adds the rollouts and restarts the cluster
 itself recorded.
 
-  - It can only compare with a time when a chat or watch was open.
-    Leave ./ts watch running to always have a history.
+  - Docker is recorded all the time, in the background. Kubernetes
+    is recorded only while a chat or watch is open, because your
+    login exists only then. Leave ./ts watch running to always
+    have a Kubernetes history.
   - Snapshots are in the log folder, under snapshots/. They are
     compressed, kept 7 days, and the folder never passes 50 MB: the
     oldest go first. They hold names, images, counts and states: no
@@ -170,6 +173,18 @@ In a chat, /report writes up what was found: summary, timeline,
 evidence, cause, fix, still unknown. It is shown and saved in the log
 folder under reports/. A model wrote it: check it before passing it on.
 
+CASES
+
+When a problem is solved, type /case. The model writes a short note:
+symptom, cause, fix, how to recognise it next time. You read it and
+type yes to keep it. Later chats search these notes first, and still
+confirm against the live system: a case is a lead, not proof.
+
+  - Saved in runbooks/_cases/<host>/ when you leave the chat, so
+    every host that runs from this folder sees it.
+  - To correct a case, edit its file. To remove one, delete the file.
+  - ./ts check shows how many are saved.
+
 VMWARE VKS
 
 A context marked "supervisor" is where VMware keeps each VKS cluster,
@@ -185,7 +200,8 @@ its machines and their VMs. Ask from any context:
 It finds the Supervisor context itself and lists only what is not
 ready, with VMware's reason (e.g. no host has enough memory, or a
 storage limit that is full). For a volume it follows the claim from
-the pod down to VMware's side. It does not switch your context. No Supervisor in the list: log in to it with
+the pod down to VMware's side. It does not switch your context. Nothing is ever changed on a Supervisor:
+the fix tools refuse it. No Supervisor in the list: log in to it with
 kubectl, then run ./ts again.
 
 SOURCE CODE
@@ -244,8 +260,15 @@ docker compose up -d. Secrets go in .env.
   max-seconds          most time for one question
   learn-max-files      most files ./ts learn reads per app
   learn-minutes        most time ./ts learn takes per app
+  learn-llm-url        another model server for ./ts learn; empty
+  learn-llm-model      = same as the chat. ./ts check tests it.
+  record-minutes       background snapshots of Docker, with no
+                       chat open; 0 = off
 
   LLM_API_KEY in .env  the model's key; empty for vLLM
+  LEARN_LLM_API_KEY    in .env: the learn model's key, if its
+                       server needs one. The chat's key is never
+                       sent to another server.
 
 WHEN SOMETHING IS WRONG
 

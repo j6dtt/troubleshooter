@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 
-from . import __version__, config, history, learn, llm, watch
+from . import __version__, cases, config, history, learn, llm, watch
 from .engine import Session
 from .redact import strip_control
 from .run import run
@@ -22,6 +22,7 @@ Follow-up questions keep the conversation going.
   /context NAME   switch, for this chat only
   /paste          paste many lines, such as command output
   /report         write this conversation up as an incident report
+  /case           save this problem and its fix for later chats
   /new    forget this conversation, start again
   /tools  list what I can look at and change
   /help   this list
@@ -168,6 +169,8 @@ def chat(settings):
             context(session, question.split()[1:])
         elif question == "/report":
             report(settings, session, ui)
+        elif question == "/case":
+            case(settings, session, ui, log)
         else:
             ui.spinner.start()
             session.ask(question)
@@ -208,6 +211,29 @@ def report(settings, session, ui):
         print(f"Saved in the log folder: reports/{name}")
     except OSError as e:
         print(paint("33", f"! Could not save the report: {e}"))
+
+
+def case(settings, session, ui, log):
+    """The model writes the note, you decide whether it is kept."""
+    ui.spinner.start()
+    text = session.case()
+    ui.done()
+    print()
+    if not text:
+        return
+    try:
+        answer = input("Save this case for later chats, on every host? Type yes, anything else to drop it: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Not saved.")
+        return
+    try:
+        name = cases.save(settings, text, session.box.active or "")
+        log(f"You saved a case: {name}")
+        print(f"Saved: {cases.title(text)}\nOther hosts see it once you leave this chat.")
+    except OSError as e:
+        print(paint("33", f"! Could not save the case: {e}"))
 
 
 def keep_history(box):
@@ -292,6 +318,7 @@ def check(settings):
         print(f"[ok] Runbooks: {len(box._runbooks())} found")
     else:
         print("[skip] Runbooks: no ./runbooks folder mounted")
+    print(f"[ok] Cases: {len(cases.all_cases(settings))} saved")
     try:
         ids = llm.models(settings)
         window = llm.context_tokens(settings)
@@ -314,6 +341,14 @@ def check(settings):
                f"{time.monotonic() - started:.1f} s" if msg.get("tool_calls") else "the model answered without calling the tool")
     except llm.LLMError as e:
         report("Tool calling", False, str(e))
+    other = config.for_learning(settings)
+    if (other.llm_url, other.llm_model) != (settings.llm_url, settings.llm_model):
+        try:
+            started = time.monotonic()
+            llm.chat(dataclasses.replace(other, llm_reasoning="off"), [{"role": "user", "content": "Reply with the word ready."}])
+            report("Learn model", True, f"{other.llm_model} at {other.llm_url}, {time.monotonic() - started:.1f} s")
+        except llm.LLMError as e:
+            report("Learn model", False, f"{other.llm_model} at {other.llm_url}: {e}")
     return 1 if failed else 0
 
 
@@ -332,6 +367,15 @@ def main():
         return check(settings)
     if command == "learn":
         return learn.main(settings, sys.argv[2:], make_log(settings))
+    if command == "cases-export":  # used by ./ts, which copies cases to the shared folder as you
+        if sys.argv[2:3] == ["--sent"]:
+            cases.sent(settings, sys.argv[3:])
+        else:
+            print(json.dumps(cases.waiting(settings)))
+        return 0
+    if command == "record":  # the container's own start command
+        history.record_forever(Toolbox(settings), settings.record_minutes)
+        return 0
     if command == "watch":
         return watch.main(settings, Toolbox(settings), sys.argv[2:], make_log(settings))
     if command == "tools":

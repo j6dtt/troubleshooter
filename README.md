@@ -38,9 +38,10 @@ Log: `logs/<date>.log`, including every approval and refusal.
 
 ## What changed, watch and report
 
-- **What changed:** while a chat or `./ts watch` is open, the state is written
-  down every 5 minutes (images, replica counts, restarts, nodes, configmap
-  versions, containers, VKS machines and VMs). Ask "what changed in the last 2
+- **What changed:** the state is written down every 5 minutes: Docker all the
+  time in the background, Kubernetes while a chat or `./ts watch` is open
+  (images, replica counts, restarts, nodes, configmap versions, containers,
+  VKS machines and VMs). Ask "what changed in the last 2
   hours?" to compare then with now. Snapshots are in the log folder under
   `snapshots/`: compressed, kept 7 days, never more than 50 MB in all (the
   oldest go first), with no settings values or Secrets.
@@ -49,6 +50,11 @@ Log: `logs/<date>.log`, including every approval and refusal.
   always have a history for "what changed".
 - **`/report`:** in a chat, writes up the findings as an incident report and
   saves it in the log folder under `reports/`.
+- **`/case`:** when a problem is solved, saves a short note (symptom, cause,
+  fix, how to recognise it) after you confirm it. Later chats search these
+  first and still check the live system. Notes are in `runbooks/_cases/<host>/`,
+  shared by every host that runs from the same folder; edit or delete the
+  files to correct them.
 
 ## Kubernetes and VKS
 

@@ -23,8 +23,8 @@ What comes next, in build order. Done items are ticked.
 - [x] 8. "What changed?": a small snapshot every 5 minutes (restarts,
       images, replicas, node and VM state) and a diff on request.
       Covers rollout history too.
-- [ ] 9. Case memory: each solved problem saved as symptom, cause, fix
-      in the shared folder, and read first when the symptom returns.
+- [x] 9. Case memory: `/case` saves a solved problem as symptom, cause,
+      fix in the shared folder; later chats search it first.
 - [ ] 10. Runbooks in real use: review the first `./ts learn` drafts
       from production and tune what they get wrong.
 
@@ -43,8 +43,14 @@ What comes next, in build order. Done items are ticked.
       tasks. Needs a read-only vCenter account.
 - [ ] 15. NSX read-only tools, only if the network kinds on the
       Supervisor leave gaps. Needs NSX API access.
-- [ ] 16. `learn-model` setting: one model for chat and another for
-      `./ts learn` at the same time.
+- [x] 16. `learn-llm-url` and `learn-llm-model`: one model for chat and
+      another for `./ts learn`.
+
+## Also done
+
+- [x] Fix tools refuse a Supervisor context.
+- [x] Background recorder: Docker snapshots with no chat open.
+- [x] Snapshots compressed, folder capped at 50 MB.
 
 ## Housekeeping
 

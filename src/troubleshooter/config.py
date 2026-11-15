@@ -1,4 +1,5 @@
 """Settings, read from environment variables set in compose.yaml (secrets in .env)."""
+import dataclasses
 import os
 from dataclasses import dataclass, field
 
@@ -35,6 +36,10 @@ class Settings:
     runbook_dir: str = "/runbooks"
     learn_max_files: int = 40
     learn_minutes: int = 30
+    learn_llm_url: str = ""
+    learn_llm_model: str = ""
+    learn_llm_api_key: str = field(default="", repr=False)
+    record_minutes: int = 5
     helper_image: str = "troubleshooter-runtime:2"
 
 
@@ -62,5 +67,21 @@ def load():
         runbook_dir=os.environ.get("RUNBOOK_DIR", "/runbooks"),
         learn_max_files=int(os.environ.get("LEARN_MAX_FILES", "40")),
         learn_minutes=int(os.environ.get("LEARN_MINUTES", "30")),
+        learn_llm_url=os.environ.get("LEARN_LLM_URL", "").rstrip("/"),
+        learn_llm_model=os.environ.get("LEARN_LLM_MODEL", ""),
+        learn_llm_api_key=os.environ.get("LEARN_LLM_API_KEY", ""),
+        record_minutes=int(os.environ.get("RECORD_MINUTES", "5") or 0),
         helper_image=os.environ.get("HELPER_IMAGE", "troubleshooter-runtime:2"),
     )
+
+
+def for_learning(s):
+    """The settings ./ts learn talks to its model with: the chat's, unless a learn model is set.
+
+    The chat's key is only sent to the chat's server: another server gets LEARN_LLM_API_KEY, or none.
+    """
+    if not (s.learn_llm_url or s.learn_llm_model):
+        return s
+    url = s.learn_llm_url or s.llm_url
+    key = s.learn_llm_api_key or (s.llm_api_key if url == s.llm_url else "")
+    return dataclasses.replace(s, llm_url=url, llm_model=s.learn_llm_model or s.llm_model, llm_api_key=key)

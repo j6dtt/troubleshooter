@@ -15,7 +15,7 @@ import socket
 import sys
 import time
 
-from . import llm
+from . import config, llm
 from .redact import _PEM, mask, strip_control
 from .run import run
 from .tools import SECRET_FILE, SKIP_DIRS, BadInput, Toolbox, runbook_status
@@ -307,7 +307,7 @@ def blocked(settings, host, app, path):
 def main(settings, argv, log=lambda line: None):
     """Leaves a note of this process, so ./ts can stop it here if the operator stops ./ts."""
     # Thinking used up the whole reply on one file and left no answer; it isn't needed to take notes.
-    settings = dataclasses.replace(settings, llm_reasoning="off")
+    settings = dataclasses.replace(config.for_learning(settings), llm_reasoning="off")
     note = f"/tmp/learn.{os.environ['LEARN_RUN']}" if os.environ.get("LEARN_RUN", "").isdigit() else None
     if note:
         with open(note, "w") as f:
@@ -353,7 +353,7 @@ def _learn(settings, argv, log):
         say(f"Nothing to read in {path}.")
         return 1
     say(f"Reading {len(files)} files from {path} on {host}. {left} others left out. "
-        f"Time limit {settings.learn_minutes} minutes.")
+        f"Time limit {settings.learn_minutes} minutes. Model: {settings.llm_model}.")
     log(f"Started a runbook for {app} from {path}: {len(files)} files")
 
     facts, dropped, done, cut_files, failed_in_a_row, silent = [], 0, 0, [], 0, []

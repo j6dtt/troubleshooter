@@ -5,10 +5,14 @@ on Python 3.6 or newer, as found on older hosts.
 
   - Starts one kubectl proxy per context on 127.0.0.1, as you, so the container can use your logins.
     They stop when this ends.
+  - After a chat: copies the cases you saved with /case to runbooks/_cases/<host>/, as you, so
+    every host that runs from this folder sees them.
   - ./ts watch: stopping it, or losing its terminal, stops the watch in the container too.
   - ./ts learn: saves the runbook as you, in runbooks/<this host>/, so it works on a shared folder
     where the container's root can't write. Stopping it stops the work in the container too.
 """
+import io
+import json
 import os
 import re
 import shutil
@@ -173,6 +177,37 @@ def watch(signals, proxies, args):
                         stderr=subprocess.DEVNULL)
 
 
+def share_cases():
+    """Cases saved in the chat wait in the container's log folder; write them to the shared folder as you."""
+    try:
+        found = json.loads(quiet(["docker", "compose", "exec", "-T", "troubleshooter", "ts", "cases-export"]) or "{}")
+    except ValueError:
+        return
+    done = []
+    for key in sorted(found if isinstance(found, dict) else []):
+        host, _, name = key.partition("/")
+        if safe(host) != host or safe(name) != name or name.startswith(".") or not name.endswith(".md") or host.startswith("."):
+            continue
+        folder = os.path.join("runbooks", "_cases", host)
+        tmp = os.path.join(folder, ".{}.{}".format(name, os.getpid()))
+        try:
+            os.makedirs(folder, exist_ok=True)
+            os.chmod(os.path.dirname(folder), 0o755)
+            os.chmod(folder, 0o755)
+            with io.open(tmp, "w", encoding="utf-8") as out:
+                out.write(found[key])
+            os.chmod(tmp, 0o644)
+            os.rename(tmp, os.path.join(folder, name))
+            done.append(key)
+        except (OSError, TypeError) as e:
+            print("Could not copy a case to ./{}: {}. It stays on this host.".format(folder, e))
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    if done:
+        quiet(["docker", "compose", "exec", "-T", "troubleshooter", "ts", "cases-export", "--sent"] + done)
+        print("Saved {} case(s) for every host in ./runbooks/_cases/".format(len(done)))
+
+
 def main():
     args = sys.argv[1:]
     os.chdir(HOME)
@@ -189,6 +224,8 @@ def main():
         if args[:1] == ["watch"]:
             return watch(signals, proxies, args)
         code = signals.call(exec_args(proxies) + args)
+        if args[:1] in ([], ["chat"]):
+            share_cases()
         return 130 if signals.stopped and code else code
     except Stopped:
         return 130
