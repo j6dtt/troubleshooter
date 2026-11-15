@@ -2,12 +2,14 @@
 
 Kubernetes keeps little history and Docker almost none, so the state is written down while ./ts runs
 (a chat or ./ts watch): your login to a cluster only exists then. A snapshot is saved only when it
-differs from the last one, so quiet days cost almost nothing.
+differs from the last one, so quiet days cost almost nothing. They are compressed, at most 7 days
+old, and the folder never passes 50 MB: the oldest are removed first.
 
 Snapshots live in the log folder, which is local to each host. They hold names, images, counts and
 states; never settings, environment values or Secrets.
 """
 import calendar
+import gzip
 import json
 import os
 import re
@@ -19,6 +21,7 @@ from .tools import CLUSTER_LABEL, VKS_KINDS
 
 EVERY = 300          # seconds between snapshots while a chat or watch runs
 KEEP_DAYS = 7
+MOST_BYTES = 50_000_000   # the snapshot folder never grows past this; the oldest go first
 MOST = 80            # most lines of differences shown
 WORKLOADS = "deployments.apps,statefulsets.apps,daemonsets.apps"
 CONFIG_COLUMNS = "custom-columns=NS:.metadata.namespace,NAME:.metadata.name,RV:.metadata.resourceVersion"
@@ -139,18 +142,47 @@ def take(box):
 
 # ---------- keeping snapshots ----------
 def _files(settings):
+    """Snapshot files, oldest first. The name is the time taken, so they sort by it."""
     try:
-        return sorted(f for f in os.listdir(folder(settings)) if f.endswith(".json"))
+        return sorted(f for f in os.listdir(folder(settings)) if f.endswith((".json.gz", ".json")))
     except OSError:
         return []
 
 
+def _taken(name):
+    """When a snapshot file was taken, from its name."""
+    try:
+        return calendar.timegm(time.strptime(name[:15], "%Y%m%d-%H%M%S"))
+    except ValueError:
+        return 0
+
+
 def _read(settings, name):
     try:
-        with open(os.path.join(folder(settings), name), encoding="utf-8") as f:
+        with (gzip.open if name.endswith(".gz") else open)(os.path.join(folder(settings), name), "rt", encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError, EOFError):
         return None
+
+
+def _tidy(settings):
+    """Keeps the folder small: nothing older than KEEP_DAYS, and no more than MOST_BYTES in all.
+
+    The oldest go first. The newest file always stays: it is what the next snapshot is compared with.
+    """
+    sizes = []
+    for name in os.listdir(folder(settings)):
+        path = os.path.join(folder(settings), name)
+        if name.endswith(".tmp") and os.path.getmtime(path) < time.time() - 3600:
+            os.unlink(path)  # left behind by a write that was cut short
+    for name in _files(settings):
+        path = os.path.join(folder(settings), name)
+        sizes.append((path, os.path.getsize(path), os.path.getmtime(path)))
+    total = sum(size for _, size, _ in sizes)
+    for path, size, seen in sizes[:-1]:
+        if seen < time.time() - KEEP_DAYS * 86400 or total > MOST_BYTES:
+            os.unlink(path)
+            total -= size
 
 
 def _same(a, b):
@@ -175,14 +207,11 @@ def save(settings, snap):
         if _same(last, snap):
             os.utime(os.path.join(folder(settings), names[-1]))  # the file's time says: still true at this moment
             return False
-        final = os.path.join(folder(settings), time.strftime("%Y%m%d-%H%M%S", time.gmtime(snap["time"])) + ".json")
-        with open(final + ".tmp", "w", encoding="utf-8") as f:
+        final = os.path.join(folder(settings), time.strftime("%Y%m%d-%H%M%S", time.gmtime(snap["time"])) + ".json.gz")
+        with gzip.open(final + ".tmp", "wt", encoding="utf-8") as f:
             json.dump(snap, f, separators=(",", ":"))
         os.replace(final + ".tmp", final)
-        for old in names:
-            path = os.path.join(folder(settings), old)
-            if os.path.getmtime(path) < time.time() - KEEP_DAYS * 86400:
-                os.unlink(path)
+        _tidy(settings)
         return True
     except OSError:
         return False
@@ -200,18 +229,17 @@ def record(box):
 
 def before(settings, when):
     """(snapshot, until): the newest state recorded at or before `when`, and when it was last seen unchanged."""
-    best = None
-    for name in _files(settings):
+    for name in reversed(_files(settings)):
+        if _taken(name) > when:
+            continue
         snap = _read(settings, name)
-        if snap and snap.get("time", 0) <= when:
-            best = (snap, name)
-    if not best:
-        return None, None
-    try:
-        until = os.path.getmtime(os.path.join(folder(settings), best[1]))
-    except OSError:
-        until = best[0]["time"]
-    return best[0], max(until, best[0]["time"])
+        if snap:
+            try:
+                until = os.path.getmtime(os.path.join(folder(settings), name))
+            except OSError:
+                until = snap["time"]
+            return snap, max(until, snap["time"])
+    return None, None
 
 
 def oldest(settings):

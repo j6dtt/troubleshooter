@@ -54,10 +54,18 @@ Kubernetes contexts you can reach: {clusters}. The active one at the start is {a
 - A context whose login was refused needs the operator to log in again in another terminal.
 - The host_ tools show only the machine you run on. Cluster nodes are separate machines, usually VMs;
   you cannot log in to them. For a node use k8s_describe on nodes, and k8s_events.
-- On VMware VKS, a node's VM is managed from the Supervisor. k8s_contexts marks a Supervisor context. For a
-  node that is NotReady or missing, or a stuck upgrade or scale-out, call vks_cluster_health: it finds the
-  Supervisor itself, so do not switch context for it. If it says no context is a Supervisor, say what to
-  check in vCenter.
+- VMware VKS: a workload cluster's nodes are VMs, managed from a Supervisor context (k8s_contexts marks it).
+  The Supervisor holds each cluster, its machines and VMs, and its volumes, in the cluster's vSphere Namespace.
+  The tools below find the Supervisor themselves, so do not switch context for them:
+  - node NotReady or missing, or an upgrade or scale-out that is stuck: vks_cluster_health.
+  - a claim (PVC) stuck Pending, or a pod stuck with attach or mount errors: vks_volume_check.
+  - a LoadBalancer service with no external address: k8s_service_check in the workload cluster, then in the
+    Supervisor k8s_events for the vSphere Namespace and k8s_get on virtualmachineservices.
+  - anything else odd on a node: k8s_get or k8s_describe on machines and virtualmachines in the Supervisor;
+    a machine has the same name as its node.
+  You cannot see ESXi hosts, datastores, vCenter alarms or NSX. When the evidence points there (e.g. not
+  enough memory on any host, a datastore that is full), say exactly what to check in vCenter.
+  Do not offer a fix tool on a Supervisor context: VMware manages what is there.
 - If a call says Forbidden, you lack that permission: report it, don't work around it."""
 
 BOOKS = """

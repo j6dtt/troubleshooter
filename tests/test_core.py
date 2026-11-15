@@ -4,6 +4,7 @@ import json
 import os
 import ssl
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
@@ -655,6 +656,114 @@ class KubeTools(unittest.TestCase):
         self.assertIn("TCP: could not connect to 127.0.0.1 port 1", patch_off.text)
 
 
+class VksVolumes(unittest.TestCase):
+    """The claim lives in the workload context; VMware's copy of it lives in the Supervisor."""
+
+    UID = "1111-2222"
+    HANDLE = "cluster-uid-1111-2222"
+
+    def setUp(self):
+        self.work, self.sup, self.calls = {}, {}, []
+        self.box = tools.Toolbox(Settings(), clusters={
+            "work": tools.Cluster("work", "", "work"), "super": tools.Cluster("super", "", "super", namespace="team-a")})
+        patch = mock.patch.object(tools, "run", self.kubectl)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.claim()
+
+    def kubectl(self, argv, timeout=30, parsed=False):
+        self.calls.append(argv)
+        supervisor = argv[argv.index("--context") + 1] == "super"
+        if "/apis/cluster.x-k8s.io" in argv:
+            return reply(supervisor, "{}" if supervisor else "Error from server (NotFound): the server could not find the requested resource")
+        for words, answer in (self.sup if supervisor else self.work).items():
+            if all(w in argv for w in words.split()):
+                return reply(True, answer if isinstance(answer, str) else json.dumps(answer))
+        return reply(False, "Error from server (NotFound): not found")
+
+    def claim(self, phase="Bound", sup_phase="Bound", attached=True, error=""):
+        meta = {"name": "data", "namespace": "shop", "uid": self.UID}
+        self.work["persistentvolumeclaims data"] = {"metadata": meta, "status": {"phase": phase}, "spec": {
+            "volumeName": "pvc-9" if phase == "Bound" else None, "storageClassName": "gold", "resources": {"requests": {"storage": "20Gi"}}}}
+        self.work["persistentvolumes pvc-9"] = {"spec": {"csi": {"volumeHandle": self.HANDLE}}, "status": {"phase": "Bound"}}
+        self.work["volumeattachments"] = {"items": [{"spec": {"nodeName": "w-1", "source": {"persistentVolumeName": "pvc-9"}},
+                                                     "status": {"attached": attached, **({"attachError": {"message": error}} if error else {})}}]}
+        self.work["pods"] = {"items": [{**pod("db-0", ready=attached, node="w-1"), "spec": {
+            "nodeName": "w-1", "volumes": [{"persistentVolumeClaim": {"claimName": "data"}}]}}]}
+        self.work["events"] = "LAST SEEN TYPE REASON\n1m Warning ProvisioningFailed storage policy quota exceeded"
+        self.sup["persistentvolumeclaims"] = {"items": [
+            {"metadata": {"name": self.HANDLE, "namespace": "team-a"}, "status": {"phase": sup_phase}},
+            {"metadata": {"name": "someone-elses", "namespace": "team-a"}, "status": {"phase": "Pending"}}]}
+        self.sup["cnsnodevmattachments.cns.vmware.com"] = {"items": [
+            {"metadata": {"name": "w-1-" + self.HANDLE, "namespace": "team-a"}, "spec": {"volumeName": self.HANDLE},
+             "status": {"attached": attached, **({"error": "disk is locked by another VM"} if not attached else {})}}]}
+        self.sup["resourcequotas"] = {"items": [{"status": {
+            "hard": {"gold.storageclass.storage.k8s.io/requests.storage": "100Gi", "requests.cpu": "10"},
+            "used": {"gold.storageclass.storage.k8s.io/requests.storage": "95Gi", "requests.cpu": "10"}}}]}
+        self.sup["events"] = "LAST SEEN TYPE REASON\n1m Warning ProvisioningFailed datastore is out of space"
+
+    def test_healthy_volume_shows_the_whole_chain(self):
+        out = self.box.vks_volume_check("work", "data", "shop")
+        for line in ("CLAIM shop/data (context work): Bound, 20Gi, storage class gold",
+                     f"Volume pvc-9: Bound, known to VMware as {self.HANDLE}",
+                     "Attached to node w-1", "Used by pod db-0 on node w-1",
+                     f"SUPERVISOR context super, namespace team-a: claim {self.HANDLE} is Bound",
+                     f"Attached to VM, by w-1-{self.HANDLE}"):
+            self.assertIn(line, out)
+        self.assertNotIn("someone-elses", out)
+
+    def test_attach_failure_shows_both_sides(self):
+        self.claim(attached=False, error="rpc error: failed to attach disk")
+        out = self.box.vks_volume_check("work", "data", "shop")
+        self.assertIn("- NOT attached to node w-1: rpc error: failed to attach disk", out)
+        self.assertIn(f"- NOT attached to VM, by w-1-{self.HANDLE}: disk is locked by another VM", out)
+        self.assertIn("- pod db-0 on node w-1: CrashLoopBackOff", out)
+
+    def test_pending_claim_is_found_in_the_supervisor_by_its_id(self):
+        self.claim(phase="Pending", sup_phase="Pending")
+        out = self.box.vks_volume_check("work", "data", "shop")
+        self.assertIn("- the claim is Pending: no volume has been made for it yet", out)
+        self.assertIn("storage policy quota exceeded", out)
+        self.assertIn("- VMware has not provided the volume (Pending)", out)
+        self.assertIn("datastore is out of space", out)
+        self.assertIn("- storage limit gold.storageclass.storage.k8s.io/requests.storage in namespace team-a: 95Gi used of 100Gi", out)
+        self.assertNotIn("requests.cpu", out)
+
+    def test_without_a_supervisor_login(self):
+        box = tools.Toolbox(Settings(), clusters={"work": tools.Cluster("work", "", "work")})
+        out = box.vks_volume_check(None, "data", "shop")
+        self.assertIn("CLAIM shop/data", out)
+        self.assertIn("none of your contexts is a Supervisor", out)
+
+    def test_overview_lists_only_problems(self):
+        self.claim(attached=False)
+        self.work["persistentvolumeclaims"] = {"items": [
+            {"metadata": {"name": "data", "namespace": "shop"}, "status": {"phase": "Bound"}},
+            {"metadata": {"name": "cache", "namespace": "shop"}, "status": {"phase": "Pending"}}]}
+        out = self.box.vks_volume_check("work", None, None)
+        self.assertIn("CONTEXT work: 2 claims; 2 volume problems", out)
+        self.assertIn("- claim shop/cache: Pending", out)
+        self.assertIn("- volume pvc-9 not attached to node w-1", out)
+        self.assertIn("- claim team-a/someone-elses: Pending", out)
+        self.assertIn(f"- team-a/w-1-{self.HANDLE} not attached to its VM: disk is locked by another VM", out)
+        self.assertNotIn("shop/data:", out)
+
+    def test_claim_must_be_asked_from_the_workload_cluster(self):
+        with self.assertRaises(tools.BadInput):
+            self.box.vks_volume_check("super", "data", "shop")
+        with self.assertRaises(tools.BadInput):
+            self.box.vks_volume_check("work", "a;b", "shop")
+
+    def test_quantities(self):
+        self.assertEqual(tools.amount("20Gi"), 20 * 2 ** 30)
+        self.assertEqual(tools.amount("1500M"), 1.5e9)
+        self.assertEqual(tools.amount("10"), 10)
+        self.assertIsNone(tools.amount("lots"))
+
+    def test_host_log_units_still_there(self):
+        self.assertIn("docker.service", tools.UNITS["docker"])
+
+
 def snapshot(when, image="shop/web:1.2", ready=3, restarts=None, config="100", machine="Running", docker=None):
     return {"time": when, "docker": docker if docker is not None else {
                 "relay": {"image": "relay:4", "build": "abc", "state": "running", "restarts": 0, "started": "2026-11-01T00:00:00Z"}},
@@ -716,6 +825,27 @@ class History(unittest.TestCase):
         os.utime(first, (0, 0))
         history.save(self.s, snapshot(2000, image="shop/web:1.3"))
         self.assertEqual(len(os.listdir(history.folder(self.s))), 1)
+
+    def test_folder_never_passes_its_size_limit(self):
+        with mock.patch.object(history, "MOST_BYTES", 2500):
+            for n in range(12):
+                history.save(self.s, snapshot(1000 + n * 300, image=f"shop/web:1.{n}", docker={"pad": {"image": os.urandom(300).hex()}}))
+        names = sorted(os.listdir(history.folder(self.s)))
+        size = sum(os.path.getsize(os.path.join(history.folder(self.s), n)) for n in names)
+        self.assertLess(len(names), 12)
+        self.assertLessEqual(size, 2500 + 1000)  # the newest file is always kept, so one file over at most
+        self.assertTrue(names[-1].startswith(time.strftime("%Y%m%d-%H%M%S", time.gmtime(1000 + 11 * 300))))
+
+    def test_files_are_compressed_and_old_plain_ones_still_read(self):
+        history.save(self.s, snapshot(1000))
+        name = os.listdir(history.folder(self.s))[0]
+        self.assertTrue(name.endswith(".json.gz"))
+        with open(os.path.join(history.folder(self.s), name), "rb") as f:
+            self.assertEqual(f.read(2), b"\x1f\x8b")
+        with open(os.path.join(history.folder(self.s), "19700101-000500.json"), "w") as f:
+            json.dump(snapshot(300, image="shop/web:1.0"), f)
+        got, _ = history.before(self.s, 500)
+        self.assertEqual(got["k8s"]["a"]["workloads"]["deployment shop/web"]["images"], ["shop/web:1.0"])
 
     def test_snapshot_holds_no_settings_or_secret_values(self):
         inspect = [{"Name": "/relay", "Image": "sha256:" + "a" * 64, "RestartCount": 2,

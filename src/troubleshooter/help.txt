@@ -143,9 +143,10 @@ itself recorded.
 
   - It can only compare with a time when a chat or watch was open.
     Leave ./ts watch running to always have a history.
-  - Snapshots are in the log folder, under snapshots/, kept 7 days.
-    They hold names, images, counts and states: no settings values,
-    no Secrets.
+  - Snapshots are in the log folder, under snapshots/. They are
+    compressed, kept 7 days, and the folder never passes 50 MB: the
+    oldest go first. They hold names, images, counts and states: no
+    settings values, no Secrets.
 
 WATCH
 
@@ -177,9 +178,14 @@ its machines and their VMs. Ask from any context:
   Why is node prod1-w-2 missing?
   Is the upgrade of cluster prod1 stuck?
 
+  Why is the claim data in namespace shop stuck Pending?
+  Pod db-0 is stuck in ContainerCreating. Is it the volume?
+  Are there any volume problems?
+
 It finds the Supervisor context itself and lists only what is not
-ready, with VMware's reason (e.g. no host has enough memory). It does
-not switch your context. No Supervisor in the list: log in to it with
+ready, with VMware's reason (e.g. no host has enough memory, or a
+storage limit that is full). For a volume it follows the claim from
+the pod down to VMware's side. It does not switch your context. No Supervisor in the list: log in to it with
 kubectl, then run ./ts again.
 
 SOURCE CODE

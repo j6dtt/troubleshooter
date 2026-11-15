@@ -9,9 +9,9 @@ What comes next, in build order. Done items are ticked.
 - [x] 2. `vks_cluster_health`: one call walks cluster, control plane,
       worker pools, machines, node VMs and warning events, and reports
       only what is not ready, with the reason.
-- [ ] 3. `vks_volume_check`: for a stuck PVC, show the CNS attach and
-      volume operation errors.
-- [ ] 4. VKS instructions for the model: which context and kinds to
+- [x] 3. `vks_volume_check`: follows a claim (PVC) from its pod to the
+      volume, the attach, and the Supervisor's side, with VMware's error.
+- [x] 4. VKS instructions for the model: which context and kinds to
       check for each symptom.
 - [x] 5. `pod_net_test`: DNS and TCP test from inside a pod.
 - [x] 6. `k8s_workload_logs`: logs of all pods of a workload in one call.
@@ -50,7 +50,9 @@ What comes next, in build order. Done items are ticked.
 
 - [ ] Rebuild the bundle (the current one predates the GPT-5.4 fixes).
 - [ ] Run the launcher on Python 3.6 (only syntax-checked so far).
-- [ ] Test the VKS tools on a real Supervisor (built against fake
-      kubectl output shaped like the real kinds).
-- [ ] Test the Kubernetes tools (items 5 to 8) on a real cluster: dev
-      has none, so they were built against canned kubectl answers.
+- [x] Supervisor label, `vks_cluster_health`, `what_changed` and
+      `./ts watch` confirmed on a real VKS Supervisor (healthy clusters).
+- [ ] See `vks_cluster_health` and `vks_volume_check` report a real
+      fault: both were built against canned kubectl answers.
+- [ ] Try `pod_net_test`, `k8s_workload_logs` and `k8s_service_check`
+      on a real cluster: dev has none.

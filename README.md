@@ -42,7 +42,8 @@ Log: `logs/<date>.log`, including every approval and refusal.
   down every 5 minutes (images, replica counts, restarts, nodes, configmap
   versions, containers, VKS machines and VMs). Ask "what changed in the last 2
   hours?" to compare then with now. Snapshots are in the log folder under
-  `snapshots/`, kept 7 days, with no settings values or Secrets.
+  `snapshots/`: compressed, kept 7 days, never more than 50 MB in all (the
+  oldest go first), with no settings values or Secrets.
 - **`./ts watch`:** checks health every 60 seconds (`--every N` to change) and
   prints only what is NEW or OK AGAIN. No model is used. Leave it running to
   always have a history for "what changed".
@@ -67,7 +68,8 @@ approval names it.
 keeps each VKS cluster, its machines and their VMs. Ask "why is node X
 missing?" or "is the upgrade stuck?" from any context: `vks_cluster_health`
 finds the Supervisor itself and lists only what is not ready, with VMware's
-reason. See [ROADMAP.md](ROADMAP.md) for what comes next.
+reason. For storage, `vks_volume_check` follows a claim (PVC) from its pod to
+the volume, the attach, and the Supervisor's side. See [ROADMAP.md](ROADMAP.md) for what comes next.
 
 Contexts can be workload clusters or the Supervisor, with your permissions. If
 a login is refused, log in again in another terminal; no restart needed. New

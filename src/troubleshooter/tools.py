@@ -262,6 +262,18 @@ def selector(labels):
     return ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
 
 
+SIZES = {"Ki": 2 ** 10, "Mi": 2 ** 20, "Gi": 2 ** 30, "Ti": 2 ** 40, "Pi": 2 ** 50,
+         "k": 10 ** 3, "M": 10 ** 6, "G": 10 ** 9, "T": 10 ** 12, "P": 10 ** 15}
+
+
+def amount(text):
+    """Bytes for a Kubernetes quantity such as 20Gi, or None."""
+    m = re.match(r"^(\d+(?:\.\d+)?)([A-Za-z]*)$", str(text or ""))
+    if not m or (m[2] and m[2] not in SIZES):
+        return None
+    return float(m[1]) * SIZES.get(m[2], 1)
+
+
 def find_clusters(kube_dir):
     """Your current login (through ./ts), then every context of every file in the folder.
 
@@ -367,6 +379,13 @@ class Toolbox:
             raise BadInput(f"Several Supervisor contexts: {', '.join(found)}. Give one as cluster.")
         raise BadInput("None of your contexts is a Supervisor, so the VMware side can't be seen from here. "
                        "The operator needs to log in to the Supervisor with kubectl and start ./ts again.")
+
+    def _find_supervisor(self):
+        """The one Supervisor among your contexts, or None."""
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(self._role, self.clusters))
+        found = [c for c in self.clusters if self.roles.get(c) == "supervisor"]
+        return found[0] if len(found) == 1 else None
 
     def k8s_use_context(self, context):
         """Only for this chat: the kubeconfig and other terminals are not touched."""
@@ -925,6 +944,137 @@ class Toolbox:
             + f": {running} of {len(machines)} machines running; "
         return [head + (f"{len(rows)} need a look" if rows else "nothing wrong found")] + rows[:60]
 
+    def _events_of(self, cid, ns, kind, obj):
+        r = run(self._kubectl(cid, "get", "events", "-n", ns, "--sort-by=.lastTimestamp", "--field-selector",
+                              f"involvedObject.kind={kind},involvedObject.name={obj}"))
+        return [f"  {x.strip()}" for x in r.text.splitlines()[1:] if x.strip()][-6:] if r.ok else []
+
+    def vks_volume_check(self, cluster, pvc, namespace):
+        """A volume from the pod down to VMware: the claim, the volume, the attach, and the Supervisor's side."""
+        cid = self._cluster(cluster).id
+        sup = cid if self._role(cid) == "supervisor" else self._find_supervisor()
+        if not pvc:
+            return self._volume_overview(None if sup == cid else cid, sup)
+        if sup == cid:
+            raise BadInput("Give the workload cluster's context as cluster: the claim lives there. "
+                           "The Supervisor is found automatically.")
+        ns = self._ns1(cid, namespace)
+        claim, problem = self._json(cid, "persistentvolumeclaims", name(pvc, "pvc"), "-n", ns)
+        if problem:
+            return f"Could not read claim {ns}/{pvc} in context {cid}: {problem}"
+        spec, phase = claim.get("spec") or {}, (claim.get("status") or {}).get("phase", "unknown")
+        uid, volume = claim["metadata"].get("uid", ""), spec.get("volumeName")
+        text = [f"CLAIM {ns}/{pvc} (context {cid}): {phase}, {((spec.get('resources') or {}).get('requests') or {}).get('storage', '?')}"
+                f", storage class {spec.get('storageClassName') or 'none'}"]
+        if phase != "Bound":
+            text += [f"- the claim is {phase}: no volume has been made for it yet", *self._events_of(cid, ns, "PersistentVolumeClaim", pvc)]
+        handle = ""
+        if volume:
+            pv, problem = self._json(cid, "persistentvolumes", volume)
+            handle = ((pv.get("spec") or {}).get("csi") or {}).get("volumeHandle", "")
+            text.append(f"Volume {volume}: {(pv.get('status') or {}).get('phase', problem or 'unknown')}"
+                        + (f", known to VMware as {handle}" if handle else ""))
+            attached, problem = self._json(cid, "volumeattachments")
+            for a in attached.get("items") or []:
+                if ((a.get("spec") or {}).get("source") or {}).get("persistentVolumeName") != volume:
+                    continue
+                status = a.get("status") or {}
+                error = (status.get("attachError") or status.get("detachError") or {}).get("message")
+                text.append(f"{'Attached' if status.get('attached') else '- NOT attached'} to node {a['spec'].get('nodeName')}"
+                            + (f": {error[:400]}" if error else ""))
+        pods, _ = self._json(cid, "pods", "-n", ns)
+        users = [p for p in pods.get("items") or [] if any(
+            (v.get("persistentVolumeClaim") or {}).get("claimName") == pvc for v in (p.get("spec") or {}).get("volumes") or [])]
+        for p in users:
+            why = self._pod_trouble(p)
+            text.append(f"{'- pod' if why else 'Used by pod'} {p['metadata']['name']} on node "
+                        f"{(p.get('spec') or {}).get('nodeName', 'none yet')}" + (f": {why}" if why else ""))
+            if why:
+                text += [e for e in self._events_of(cid, ns, "Pod", p["metadata"]["name"])
+                         if re.search(r"attach|mount|volume", e, re.I)][-3:]
+        if not users:
+            text.append("No pod uses this claim.")
+        if not sup:
+            return "\n".join(text + ["", "The VMware side can't be seen: none of your contexts is a Supervisor (or several are). "
+                                         "Log in to the Supervisor with kubectl and start ./ts again."])
+        return "\n".join(text + ["", *self._volume_supervisor(sup, uid, handle)])
+
+    def _volume_supervisor(self, sup, uid, handle):
+        """The Supervisor's copy of a claim is named after the cluster and the claim's ID."""
+        claims, problem = self._vks_list(sup, "persistentvolumeclaims", None)
+        if problem:
+            return [f"SUPERVISOR context {sup}: could not list claims: {problem}"]
+        mine = [c for c in claims if c["metadata"]["name"] == handle or (uid and c["metadata"]["name"].endswith(uid))]
+        if not mine:
+            return [f"SUPERVISOR context {sup}: no claim there matches this one. Either the request never reached "
+                    f"VMware (see the events above), or this login can't see the cluster's vSphere Namespace."]
+        text = []
+        for c in mine:
+            ns, cname = c["metadata"]["namespace"], c["metadata"]["name"]
+            phase = (c.get("status") or {}).get("phase", "unknown")
+            text.append(f"SUPERVISOR context {sup}, namespace {ns}: claim {cname} is {phase}")
+            if phase != "Bound":
+                text += [f"- VMware has not provided the volume ({phase})", *self._events_of(sup, ns, "PersistentVolumeClaim", cname)]
+            attaches, problem = self._vks_list(sup, "cnsnodevmattachments.cns.vmware.com", ns)
+            for a in attaches:
+                if (a.get("spec") or {}).get("volumeName") != cname:
+                    continue
+                status = a.get("status") or {}
+                text.append(f"{'Attached' if status.get('attached') else '- NOT attached'} to VM, by {a['metadata']['name']}"
+                            + (f": {str(status['error'])[:400]}" if status.get("error") else ""))
+            if problem:
+                text.append(f"Attach records could not be read: {problem}")
+            text += self._quota(sup, ns)
+        return text
+
+    def _quota(self, sup, ns):
+        """Storage limits of a vSphere Namespace that are nearly or fully used."""
+        quotas, _ = self._vks_list(sup, "resourcequotas", ns)
+        rows = []
+        for q in quotas:
+            status = q.get("status") or {}
+            for key, hard in (status.get("hard") or {}).items():
+                top, used = amount(hard), amount((status.get("used") or {}).get(key))
+                if "storage" in key and top and used is not None and used >= 0.9 * top:
+                    rows.append(f"- storage limit {key} in namespace {ns}: {(status.get('used') or {}).get(key)} used of {hard}")
+        return rows
+
+    def _volume_overview(self, cid, sup):
+        """No claim named: every volume that is not as it should be."""
+        text = []
+        if cid:
+            claims, problem = self._vks_list(cid, "persistentvolumeclaims", None)
+            bad = [f"- claim {c['metadata']['namespace']}/{c['metadata']['name']}: {(c.get('status') or {}).get('phase')}"
+                   for c in claims if (c.get("status") or {}).get("phase") != "Bound"]
+            attached, _ = self._json(cid, "volumeattachments")
+            for a in attached.get("items") or []:
+                status = a.get("status") or {}
+                error = (status.get("attachError") or status.get("detachError") or {}).get("message")
+                if error or not status.get("attached"):
+                    bad.append(f"- volume {((a.get('spec') or {}).get('source') or {}).get('persistentVolumeName')} not attached "
+                               f"to node {(a.get('spec') or {}).get('nodeName')}" + (f": {error[:300]}" if error else ""))
+            text.append(f"CONTEXT {cid}: " + (f"could not list claims: {problem}" if problem else
+                                               f"{len(claims)} claims; {len(bad)} volume problems"))
+            text += bad[:40]
+        if sup:
+            claims, problem = self._vks_list(sup, "persistentvolumeclaims", None)
+            bad = [f"- claim {c['metadata']['namespace']}/{c['metadata']['name']}: {(c.get('status') or {}).get('phase')}"
+                   for c in claims if (c.get("status") or {}).get("phase") != "Bound"]
+            attaches, _ = self._vks_list(sup, "cnsnodevmattachments.cns.vmware.com", None)
+            for a in attaches:
+                status = a.get("status") or {}
+                if status.get("error") or not status.get("attached"):
+                    bad.append(f"- {a['metadata']['namespace']}/{a['metadata']['name']} not attached to its VM"
+                               + (f": {str(status['error'])[:300]}" if status.get("error") else ""))
+            for ns in sorted({c["metadata"]["namespace"] for c in claims})[:10]:
+                bad += self._quota(sup, ns)
+            text.append(f"SUPERVISOR context {sup}: " + (f"could not list claims: {problem}" if problem else
+                                                          f"{len(claims)} claims; {len(bad)} volume problems"))
+            text += bad[:40]
+        else:
+            text.append("The VMware side can't be seen: none of your contexts is a Supervisor (or several are).")
+        return "\n".join(text + ["Give pvc and namespace to follow one claim from its pod down to VMware."])
+
     # ---------- Host ----------
     def host_status(self):
         return self._host_summary()
@@ -1261,6 +1411,12 @@ class Toolbox:
               lambda cluster, namespace, name: self.vks_cluster_health(cluster, namespace, name),
               {"namespace": P("string", "vSphere Namespace (default: all you can see)"),
                "name": P("string", "One VKS cluster (default: all)")}, needs_kube=True),
+            t("vks_volume_check", "VMware VKS storage: follow a claim (PVC) from its pod to the volume, the attach to the "
+              "node, and the Supervisor's side (its claim, the attach to the VM, storage limits), with VMware's error. "
+              "Use for a claim stuck Pending or a pod stuck on attach or mount errors. Without pvc: every volume problem.",
+              "Checked volume {pvc}", self.vks_volume_check,
+              {"pvc": P("string", "Claim (PVC) name in the workload cluster (default: all problems)"), "namespace": ns1},
+              needs_kube=True),
             t("host_status", "Load, memory, swap and disks of the machine running this tool, not of cluster nodes.", "Read host status", self.host_status),
             t("host_processes", "Top host processes.", "Read top host processes", self.host_processes,
               {"sort": P("string", "cpu or memory", enum=("cpu", "memory"))}),
