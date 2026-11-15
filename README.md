@@ -36,6 +36,19 @@ words aren't in the file is dropped. Review it, then change `Status: DRAFT`
 to `Status: REVIEWED`. See `./ts --help`.
 Log: `logs/<date>.log`, including every approval and refusal.
 
+## What changed, watch and report
+
+- **What changed:** while a chat or `./ts watch` is open, the state is written
+  down every 5 minutes (images, replica counts, restarts, nodes, configmap
+  versions, containers, VKS machines and VMs). Ask "what changed in the last 2
+  hours?" to compare then with now. Snapshots are in the log folder under
+  `snapshots/`, kept 7 days, with no settings values or Secrets.
+- **`./ts watch`:** checks health every 60 seconds (`--every N` to change) and
+  prints only what is NEW or OK AGAIN. No model is used. Leave it running to
+  always have a history for "what changed".
+- **`/report`:** in a chat, writes up the findings as an incident report and
+  saves it in the log folder under `reports/`.
+
 ## Kubernetes and VKS
 
 Log in as usual, then run `./ts`. It starts on your current kubectl context
@@ -49,6 +62,12 @@ works) and `/context NAME` switches. You can also just ask: "switch to the
 Supervisor". Switching lasts for this chat only and never changes your
 kubeconfig or other terminals. The prompt shows the active context, and every
 approval names it.
+
+`/context` marks a Supervisor context ("supervisor"). That is where VMware
+keeps each VKS cluster, its machines and their VMs. Ask "why is node X
+missing?" or "is the upgrade stuck?" from any context: `vks_cluster_health`
+finds the Supervisor itself and lists only what is not ready, with VMware's
+reason. See [ROADMAP.md](ROADMAP.md) for what comes next.
 
 Contexts can be workload clusters or the Supervisor, with your permissions. If
 a login is refused, log in again in another terminal; no restart needed. New

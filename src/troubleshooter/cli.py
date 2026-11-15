@@ -4,11 +4,12 @@ import datetime
 import json
 import os
 import shutil
+import socket
 import sys
 import threading
 import time
 
-from . import __version__, config, learn, llm
+from . import __version__, config, history, learn, llm, watch
 from .engine import Session
 from .redact import strip_control
 from .run import run
@@ -20,6 +21,7 @@ Follow-up questions keep the conversation going.
   /context        list Kubernetes contexts (* = active)
   /context NAME   switch, for this chat only
   /paste          paste many lines, such as command output
+  /report         write this conversation up as an incident report
   /new    forget this conversation, start again
   /tools  list what I can look at and change
   /help   this list
@@ -132,6 +134,7 @@ def chat(settings):
     ui = Terminal()
     log = make_log(settings)
     session = Session(settings, ui, log)
+    keep_history(session.box)
     print(paint("1", f"Troubleshooter {__version__}") + f"  model: {settings.llm_model}")
     print("Type /help for commands.\n")
     log(f"Chat started with model {settings.llm_model}")
@@ -163,6 +166,8 @@ def chat(settings):
             list_tools(session.box)
         elif question == "/context" or question.startswith("/context "):
             context(session, question.split()[1:])
+        elif question == "/report":
+            report(settings, session, ui)
         else:
             ui.spinner.start()
             session.ask(question)
@@ -183,6 +188,35 @@ def paste():
     except (EOFError, KeyboardInterrupt):
         print()
     return "\n".join(rows)
+
+
+def report(settings, session, ui):
+    """The write-up is shown and also kept as a file in the log folder."""
+    ui.spinner.start()
+    text = session.report()
+    ui.done()
+    print()
+    if not text:
+        return
+    now = datetime.datetime.now()
+    name = f"{now:%Y%m%d-%H%M%S}.md"
+    try:
+        os.makedirs(os.path.join(settings.log_dir, "reports"), exist_ok=True)
+        with open(os.path.join(settings.log_dir, "reports", name), "w", encoding="utf-8") as f:
+            f.write(f"Incident report\nHost: {socket.gethostname()}\nMade: {now:%Y-%m-%d %H:%M}, by the model "
+                    f"{settings.llm_model} from a troubleshooter chat. Check it before passing it on.\n\n{text}\n")
+        print(f"Saved in the log folder: reports/{name}")
+    except OSError as e:
+        print(paint("33", f"! Could not save the report: {e}"))
+
+
+def keep_history(box):
+    """Snapshots for what_changed, taken in the background while the chat is open."""
+    def loop():
+        while True:
+            history.record(box)
+            time.sleep(history.EVERY)
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def context(session, words):
@@ -298,6 +332,8 @@ def main():
         return check(settings)
     if command == "learn":
         return learn.main(settings, sys.argv[2:], make_log(settings))
+    if command == "watch":
+        return watch.main(settings, Toolbox(settings), sys.argv[2:], make_log(settings))
     if command == "tools":
         list_tools(Toolbox(settings))
         return 0
@@ -307,7 +343,7 @@ def main():
         except ImportError:
             pass
         return chat(settings)
-    print("Usage: ./ts [chat|check|tools|learn /apps/myapp|--help]")
+    print("Usage: ./ts [chat|check|watch|tools|learn /apps/myapp|--help]")
     return 2
 
 

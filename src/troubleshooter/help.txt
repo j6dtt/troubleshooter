@@ -14,6 +14,7 @@ COMMANDS
 
   ./ts                     chat
   ./ts check               test Docker, contexts, logs, the model
+  ./ts watch               watch health; speak only when it changes
   ./ts tools               list every tool it can use
   ./ts --help              this guide
 
@@ -22,6 +23,7 @@ IN THE CHAT
   /context                 list contexts (* = active)
   /context NAME            switch context, this chat only
   /paste                   paste many lines; finish with /end
+  /report                  write this chat up as an incident report
   /tools                   list every tool
   /new                     forget this conversation
   /help                    short list of these
@@ -52,9 +54,16 @@ Swarm
   Why is the service api short of replicas?
   Which nodes are down?
 
+What changed
+  It worked this morning. What changed since then?
+  What changed in the last 2 hours?
+
 Kubernetes
   Why is my pod stuck in Pending?
   Why does api keep crashing? Check the previous run's logs.
+  Why can't anything reach the service web in namespace shop?
+  Can pod web-1 reach db.shop on port 5432?
+  Show errors from all pods of deployment web, last 30 minutes.
   Switch to vks-b and show me warnings from the last hour.
 
 Host
@@ -114,6 +123,7 @@ The prompt shows the active context:
   you [vks-a]> /context
   * vks-a: ok
     vks-b: the login was refused: the token has expired or is wrong.
+    sup-ns: ok, supervisor (manages VKS clusters)
   you [vks-a]> /context vks-b
   Active context is now vks-b. Your kubeconfig was not changed.
 
@@ -121,6 +131,56 @@ You can also just ask: "switch to vks-b". Switching never changes
 your kubeconfig or other terminals. If a login expires, log in again
 in another terminal; the chat carries on. New contexts appear the
 next time you run ./ts.
+
+WHAT CHANGED
+
+Most faults follow a change. While a chat or ./ts watch is open, the
+state is written down every 5 minutes: images, replica counts,
+restarts, nodes, configmap versions, containers, and on VKS the
+machines and VMs. Ask "what changed in the last 2 hours?" and it
+compares then with now, and adds the rollouts and restarts the cluster
+itself recorded.
+
+  - It can only compare with a time when a chat or watch was open.
+    Leave ./ts watch running to always have a history.
+  - Snapshots are in the log folder, under snapshots/, kept 7 days.
+    They hold names, images, counts and states: no settings values,
+    no Secrets.
+
+WATCH
+
+  ./ts watch               check every 60 seconds
+  ./ts watch --every 300   check every 5 minutes
+
+Checks the host, Docker, Swarm, every context and, on VKS, the
+clusters a Supervisor manages. No model is used. It prints the open
+problems once, then only what is NEW or OK AGAIN:
+
+  09:14:02 NEW       docker: web-1: Exited (1) 5 seconds ago
+  09:20:02 OK AGAIN  docker: web-1: Exited (1) 6 minutes ago
+
+Ctrl-C stops it. A cluster login that expires shows as a problem: log
+in again in another terminal, and start ./ts watch again to pick up
+new contexts.
+
+REPORT
+
+In a chat, /report writes up what was found: summary, timeline,
+evidence, cause, fix, still unknown. It is shown and saved in the log
+folder under reports/. A model wrote it: check it before passing it on.
+
+VMWARE VKS
+
+A context marked "supervisor" is where VMware keeps each VKS cluster,
+its machines and their VMs. Ask from any context:
+
+  Why is node prod1-w-2 missing?
+  Is the upgrade of cluster prod1 stuck?
+
+It finds the Supervisor context itself and lists only what is not
+ready, with VMware's reason (e.g. no host has enough memory). It does
+not switch your context. No Supervisor in the list: log in to it with
+kubectl, then run ./ts again.
 
 SOURCE CODE
 

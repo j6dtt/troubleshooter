@@ -9,7 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from unittest import mock
 
-from troubleshooter import cli, engine, learn, llm, tools
+from troubleshooter import cli, engine, history, learn, llm, tools, watch
 from troubleshooter.config import Settings
 from troubleshooter.redact import clean, mask, strip_control
 from troubleshooter.run import run
@@ -430,6 +430,389 @@ esac""")
         with mock.patch.dict(os.environ, {"PATH": path}), redirect_stdout(out):
             cli.check_cluster(box, c, lambda *a: None)
         self.assertIn("1.34 and cluster 1.31", out.getvalue())
+
+
+def vks_item(name, labels=None, spec=None, status=None, ns="team-a"):
+    return {"metadata": {"name": name, "namespace": ns, "labels": labels or {}}, "spec": spec or {}, "status": status or {}}
+
+
+OF = {"cluster.x-k8s.io/cluster-name": "prod1"}
+NO_VM = {"type": "VirtualMachineCreated", "status": "False", "reason": "NotEnoughResources",
+         "message": "no host has enough memory"}
+VKS = {
+    "clusters.cluster.x-k8s.io": [vks_item("prod1", spec={"topology": {"version": "v1.33.1"}}, status={"phase": "Provisioned"}),
+                                  vks_item("other", status={"phase": "Provisioned"})],
+    "kubeadmcontrolplanes.controlplane.cluster.x-k8s.io": [vks_item("prod1-cp", OF, {"replicas": 3}, {"readyReplicas": 3})],
+    "machinedeployments.cluster.x-k8s.io": [vks_item("prod1-pool", OF, {"replicas": 2}, {"readyReplicas": 1})],
+    "machines.cluster.x-k8s.io": [
+        vks_item("prod1-cp-1", OF, {"clusterName": "prod1"}, {"phase": "Running", "nodeRef": {"name": "prod1-cp-1"}}),
+        vks_item("prod1-w-1", OF, {"clusterName": "prod1"}, {"phase": "Running", "nodeRef": {"name": "prod1-w-1"}}),
+        vks_item("prod1-w-2", OF, {"clusterName": "prod1", "infrastructureRef": {"name": "prod1-w-2"}},
+                 {"phase": "Provisioning", "conditions": [
+                     {"type": "InfrastructureReady", "status": "False", "reason": "WaitingForInfrastructure"},
+                     {"type": "Deleting", "status": "False"}]})],
+    "virtualmachines.vmoperator.vmware.com": [
+        vks_item("prod1-cp-1", status={"powerState": "PoweredOn", "network": {"primaryIP4": "10.0.0.5"}}),
+        vks_item("prod1-w-1", status={"powerState": "poweredOn", "vmIp": "10.0.0.6"}),
+        vks_item("prod1-w-2", status={"powerState": "PoweredOff", "conditions": [NO_VM]})],
+}
+
+
+class Vks(unittest.TestCase):
+    """A fake kubectl: the context named super offers the Cluster API, the one named work does not."""
+
+    def setUp(self):
+        self.calls = []
+        self.forbid_all = False
+        self.box = tools.Toolbox(Settings(), clusters={
+            "work": tools.Cluster("work", "", "work"), "super": tools.Cluster("super", "", "super", namespace="team-a")})
+        patch = mock.patch.object(tools, "run", self.kubectl)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def kubectl(self, argv, timeout=30, parsed=False):
+        self.calls.append(argv)
+        supervisor = argv[argv.index("--context") + 1] == "super"
+        if "/version" in argv:
+            return self.say("{}")
+        if "/apis/cluster.x-k8s.io" in argv:
+            return self.say("{}") if supervisor else self.fail_with("Error from server (NotFound): the server could not find the requested resource")
+        if "events" in argv:
+            return self.say("LAST SEEN  TYPE  REASON\n2m  Warning  CreateFailed  no host has enough memory")
+        kind = argv[argv.index("get") + 1]
+        if not supervisor:
+            return self.fail_with(f'error: the server doesn\'t have a resource type "{kind}"')
+        if self.forbid_all and "--all-namespaces" in argv:
+            return self.fail_with(f"Error from server (Forbidden): {kind} is forbidden")
+        return self.say(json.dumps({"items": VKS[kind]}))
+
+    @staticmethod
+    def say(text):
+        return type("R", (), {"ok": True, "text": text})()
+
+    @staticmethod
+    def fail_with(text):
+        return type("R", (), {"ok": False, "text": text})()
+
+    def test_contexts_mark_the_supervisor(self):
+        rows = self.box.k8s_contexts().splitlines()
+        self.assertEqual(rows[0], "* work: ok")
+        self.assertIn("super (namespace team-a): ok, supervisor", rows[1])
+
+    def test_role_is_asked_once(self):
+        self.box.k8s_contexts()
+        self.box.k8s_contexts()
+        self.assertEqual(sum("/apis/cluster.x-k8s.io" in c for c in self.calls), 2)  # once per context
+
+    def test_finds_the_supervisor_from_a_workload_context(self):
+        out = self.box.vks_cluster_health(None, None, "prod1")
+        self.assertIn("Asked the Supervisor context super; the active context is work", out)
+        self.assertEqual(self.box.active, "work")  # looking does not switch
+
+    def test_reports_only_what_is_wrong_with_the_reason(self):
+        out = self.box.vks_cluster_health(None, None, "prod1")
+        self.assertIn("VKS CLUSTER team-a/prod1 (v1.33.1): 2 of 3 machines running; 3 need a look", out)
+        self.assertIn("- worker pool prod1-pool: 1 of 2 ready", out)
+        self.assertIn("- machine prod1-w-2 (node no node yet): phase Provisioning; "
+                      "InfrastructureReady=False (WaitingForInfrastructure)", out)
+        self.assertIn("  - VM prod1-w-2: power PoweredOff; no IP address; "
+                      "VirtualMachineCreated=False (NotEnoughResources no host has enough memory)", out)
+        self.assertIn("Newest warning events in namespace team-a:", out)
+        for healthy in ("prod1-cp-1", "prod1-w-1", "control plane", "Deleting", "other"):
+            self.assertNotIn(healthy, out)
+
+    def test_healthy_cluster_is_one_line(self):
+        out = self.box.vks_cluster_health("super", None, "other")
+        self.assertIn("VKS CLUSTER team-a/other: 0 of 0 machines running; nothing wrong found", out)
+
+    def test_namespace_login_falls_back_to_its_own_namespace(self):
+        self.forbid_all = True
+        out = self.box.vks_cluster_health("super", None, None)
+        self.assertIn("2 VKS cluster(s)", out)
+        self.assertTrue(any(c[-2:] == ["-n", "team-a"] for c in self.calls))
+
+    def test_workload_context_is_told_plainly(self):
+        self.assertIn("Could not list VKS clusters in context work", self.box.vks_cluster_health("work", None, None))
+
+    def test_no_supervisor_at_all(self):
+        box = tools.Toolbox(Settings(), clusters={"work": tools.Cluster("work", "", "work")})
+        with self.assertRaises(tools.BadInput) as e:
+            box.vks_cluster_health(None, None, None)
+        self.assertIn("log in to the Supervisor", str(e.exception))
+
+    def test_bad_names_refused(self):
+        for args in ((None, "a;b", None), (None, None, "--all")):
+            with self.assertRaises(tools.BadInput):
+                self.box.vks_cluster_health(*args)
+
+    def test_reachable_through_the_tool_list(self):
+        t = self.box.tools["vks_cluster_health"]
+        self.assertIn("VKS CLUSTER team-a/prod1", t.fn(**t.check({"name": "prod1"})))
+        self.assertEqual(t.describe({"name": "prod1"}), "Checked VKS cluster health prod1")
+
+
+def reply(ok, text):
+    return type("R", (), {"ok": ok, "text": text})()
+
+
+def pod(name, ready=True, node="n1", labels=None, ports=(8080,), restarts=0, ended=None):
+    box = {"name": "app", "ready": ready, "restartCount": restarts, "state": {"running": {}} if ready else {"waiting": {"reason": "CrashLoopBackOff"}}}
+    if ended:
+        box["lastState"] = {"terminated": {"finishedAt": ended, "reason": "OOMKilled", "exitCode": 137}}
+    return {"metadata": {"name": name, "namespace": "shop", "labels": labels or {"app": "web"}},
+            "spec": {"nodeName": node, "containers": [{"name": "app", "ports": [{"containerPort": p} for p in ports]}]},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+                       "containerStatuses": [box]}}
+
+
+class KubeTools(unittest.TestCase):
+    """Tools that follow Kubernetes objects, against canned kubectl answers."""
+
+    def setUp(self):
+        self.calls, self.answers = [], {}
+        self.box = tools.Toolbox(Settings(), clusters=ONE)
+        patch = mock.patch.object(tools, "run", self.kubectl)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def kubectl(self, argv, timeout=30, parsed=False):
+        self.calls.append(argv)
+        for words, answer in self.answers.items():
+            if all(w in argv for w in words.split()):
+                return reply(True, answer if isinstance(answer, str) else json.dumps(answer))
+        return reply(False, "Error from server (NotFound): not found")
+
+    def service(self, target=8080, kind="ClusterIP", selector=None):
+        self.answers["services web"] = {"spec": {"type": kind, "clusterIP": "10.96.0.9", "selector": selector or {"app": "web"},
+                                                 "ports": [{"port": 80, "targetPort": target}]}, "status": {}}
+
+    def test_service_with_no_matching_pods(self):
+        self.service()
+        self.answers["endpointslices"] = {"items": []}
+        self.answers["pods"] = {"items": []}
+        out = self.box.k8s_service_check(None, "web", "shop")
+        self.assertIn("SERVICE shop/web: type ClusterIP, cluster IP 10.96.0.9, ports 80 to 8080", out)
+        self.assertIn("- no ready endpoints", out)
+        self.assertIn("- the selector app=web matches no pods in namespace shop", out)
+
+    def test_service_names_the_broken_pod_and_node(self):
+        self.service()
+        self.answers["endpointslices"] = {"items": [{"endpoints": [{"conditions": {"ready": True}}, {"conditions": {"ready": False}}]}]}
+        self.answers["pods"] = {"items": [pod("web-1"), pod("web-2", ready=False, node="n2")]}
+        self.answers["nodes"] = {"items": [
+            {"metadata": {"name": "n1"}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}},
+            {"metadata": {"name": "n2"}, "status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}}]}
+        out = self.box.k8s_service_check(None, "web", "shop")
+        self.assertIn("Endpoints: 1 ready, 1 not ready", out)
+        self.assertIn("Pods matching app=web: 2, of which 1 ready", out)
+        self.assertIn("- pod web-2 on node n2: CrashLoopBackOff", out)
+        self.assertIn("- node n2, which runs some of these pods: Ready=Unknown", out)
+        self.assertNotIn("web-1", out)
+
+    def test_service_port_mismatches(self):
+        self.answers["endpointslices"] = {"items": [{"endpoints": [{"conditions": {"ready": True}}]}]}
+        self.answers["pods"] = {"items": [pod("web-1")]}
+        self.service(target=9000)
+        self.assertIn("targetPort 9000 is not a port the pods declare (8080)", self.box.k8s_service_check(None, "web", "shop"))
+        self.service(target="http")
+        self.assertIn("targetPort 'http' is a port name that no pod defines", self.box.k8s_service_check(None, "web", "shop"))
+        self.service()
+        self.assertIn("Nothing wrong found in the chain", self.box.k8s_service_check(None, "web", "shop"))
+
+    def test_load_balancer_without_an_address(self):
+        self.service(kind="LoadBalancer")
+        self.answers["endpointslices"] = {"items": [{"endpoints": [{"conditions": {"ready": True}}]}]}
+        self.answers["pods"] = {"items": [pod("web-1")]}
+        self.assertIn("- no external address yet", self.box.k8s_service_check(None, "web", "shop"))
+
+    def test_workload_logs_use_the_workloads_own_selector(self):
+        self.answers["deployments web"] = {"spec": {"selector": {"matchLabels": {"app": "web", "tier": "front"}}}}
+        self.answers["logs"] = "[pod/web-1/app] 2026 started\n[pod/web-2/app] 2026 ERROR no database"
+        out = self.box.k8s_workload_logs(None, "deployments", "web", "shop", None, "2h", "error", False)
+        self.assertEqual(out, "[pod/web-2/app] 2026 ERROR no database")
+        sent = self.calls[-1]
+        self.assertEqual(sent[sent.index("-l") + 1], "app=web,tier=front")
+        for word in ("--prefix", "--tail=50", "--since=2h", "-n", "shop"):
+            self.assertIn(word, sent)
+
+    def test_pod_net_test_passes_host_and_port_as_arguments(self):
+        self.answers["exec"] = "DNS: db is 10.0.0.9\nTCP: connected to db port 5432 (tested with nc)"
+        self.assertIn("TCP: connected", self.box.pod_net_test(None, "web-1", "shop", "db", 5432, None))
+        sent = self.calls[-1]
+        self.assertEqual(sent[-5:-2], ["-c", tools.POD_NET_TEST, "sh"])
+        self.assertEqual(sent[-2:], ["db", "5432"])
+        self.assertNotIn("db", tools.POD_NET_TEST)
+        for host, port in (("a;rm -rf /", 80), ("$(id)", 80), ("db", 0), ("db", 70000)):
+            with self.assertRaises(tools.BadInput):
+                self.box.pod_net_test(None, "web-1", "shop", host, port, None)
+
+    def test_pod_without_a_shell(self):
+        self.answers["exec"] = 'OCI runtime exec failed: exec: "sh": executable file not found in $PATH'
+        self.assertIn("has no shell", self.box.pod_net_test(None, "web-1", "shop", "db", 5432, None))
+
+    def test_the_net_test_script_runs(self):
+        patch_off = run(["sh", "-c", tools.POD_NET_TEST, "sh", "127.0.0.1", "1"])
+        self.assertIn("TCP: could not connect to 127.0.0.1 port 1", patch_off.text)
+
+
+def snapshot(when, image="shop/web:1.2", ready=3, restarts=None, config="100", machine="Running", docker=None):
+    return {"time": when, "docker": docker if docker is not None else {
+                "relay": {"image": "relay:4", "build": "abc", "state": "running", "restarts": 0, "started": "2026-11-01T00:00:00Z"}},
+            "k8s": {"a": {
+                "workloads": {"deployment shop/web": {"images": [image], "replicas": 3, "ready": ready, "version": 4}},
+                "nodes": {"n1": {"ready": "True", "kubelet": "v1.33.1"}},
+                "restarts": restarts or {},
+                "configmaps": {"shop/web-config": config},
+                "vks": {"machine team-a/prod1-w-2 of cluster prod1": machine}}}}
+
+
+class History(unittest.TestCase):
+    def setUp(self):
+        self.s = Settings(log_dir=tempfile.mkdtemp())
+
+    def test_names_each_difference(self):
+        then = snapshot(1000)
+        now = snapshot(5000, image="shop/web:1.3", ready=1, restarts={"shop/web-7": 6}, config="250", machine="Provisioning")
+        now["docker"]["relay"].update(image="relay:5", started="2026-11-15T03:00:00Z")
+        now["docker"]["extra"] = {"image": "tool:1", "state": "running"}
+        out = "\n".join(history.differences(then, now))
+        for line in ("- container relay: image relay:4 -> relay:5; started again at 2026-11-15 03:00 UTC",
+                     "- new container extra: image tool:1, running",
+                     "- deployment shop/web: image shop/web:1.2 -> shop/web:1.3; ready 3 -> 1",
+                     "- new pod shop/web-7: restarted 6 times",
+                     "- configmap shop/web-config: its content changed",
+                     "- VKS machine team-a/prod1-w-2 of cluster prod1: Running -> Provisioning"):
+            self.assertIn(line, out)
+        self.assertNotIn("node", out)
+
+    def test_nothing_changed_is_empty(self):
+        self.assertEqual(history.differences(snapshot(1000), snapshot(5000)), [])
+
+    def test_unreadable_part_is_not_a_change(self):
+        now = snapshot(5000)
+        now["k8s"]["a"], now["docker"] = None, None
+        self.assertEqual(history.differences(snapshot(1000), now), [])
+
+    def test_saved_only_when_different_and_login_loss_keeps_last_state(self):
+        self.assertTrue(history.save(self.s, snapshot(1000)))
+        self.assertFalse(history.save(self.s, snapshot(1300)))
+        lost = snapshot(1600)
+        lost["k8s"]["a"] = None
+        self.assertFalse(history.save(self.s, lost))
+        self.assertTrue(history.save(self.s, snapshot(1900, image="shop/web:1.3")))
+        self.assertEqual(len(os.listdir(history.folder(self.s))), 2)
+
+    def test_picks_the_state_from_before_the_period(self):
+        history.save(self.s, snapshot(1000))
+        history.save(self.s, snapshot(2000, image="shop/web:1.3"))
+        history.save(self.s, snapshot(3000, image="shop/web:1.4"))
+        got, _ = history.before(self.s, 2500)
+        self.assertEqual(got["k8s"]["a"]["workloads"]["deployment shop/web"]["images"], ["shop/web:1.3"])
+        self.assertEqual(history.before(self.s, 500), (None, None))
+
+    def test_old_snapshots_are_removed(self):
+        history.save(self.s, snapshot(1000))
+        first = os.path.join(history.folder(self.s), os.listdir(history.folder(self.s))[0])
+        os.utime(first, (0, 0))
+        history.save(self.s, snapshot(2000, image="shop/web:1.3"))
+        self.assertEqual(len(os.listdir(history.folder(self.s))), 1)
+
+    def test_snapshot_holds_no_settings_or_secret_values(self):
+        inspect = [{"Name": "/relay", "Image": "sha256:" + "a" * 64, "RestartCount": 2,
+                    "Config": {"Image": "relay:4", "Env": ["DB_PASSWORD=hunter2"], "Labels": {}},
+                    "State": {"Status": "running", "StartedAt": "2026-11-01T00:00:00Z"}}]
+        with mock.patch.object(history, "run", lambda argv, **k: reply(True, "id1" if "ps" in argv else json.dumps(inspect))):
+            got = history._docker()
+        self.assertEqual(got["relay"]["restarts"], 2)
+        self.assertNotIn("hunter2", json.dumps(got))
+
+    def test_timeline_from_the_cluster(self):
+        def rs(name, rev, image, made):
+            return {"metadata": {"name": name, "namespace": "shop", "creationTimestamp": made,
+                                 "annotations": {"deployment.kubernetes.io/revision": str(rev)},
+                                 "ownerReferences": [{"kind": "Deployment", "name": "web"}]},
+                    "spec": {"template": {"spec": {"containers": [{"image": image}]}}}}
+        items = {"replicasets.apps": [rs("web-a", 4, "shop/web:1.2", "2026-11-10T00:00:00Z"), rs("web-b", 5, "shop/web:1.3", "2026-11-15T03:02:00Z")],
+                 "pods": [pod("web-7", restarts=6, ended="2026-11-15T03:05:10Z"), pod("web-8", ended="2026-11-01T00:00:00Z")],
+                 "nodes": [{"metadata": {"name": "n1"}, "status": {"conditions": [
+                     {"type": "Ready", "status": "False", "reason": "KubeletNotReady", "lastTransitionTime": "2026-11-15T03:20:00Z"}]}}]}
+        with mock.patch.object(history, "_items", lambda box, cid, kind: items[kind]):
+            rows = history.timeline(None, "a", history.stamp("2026-11-15T03:00:00Z"))
+        self.assertEqual(rows, [
+            "- 03:02 UTC deployment shop/web rolled out revision 5: image shop/web:1.2 -> shop/web:1.3",
+            "- 03:05 UTC pod shop/web-7 container app ended (OOMKilled, exit code 137) and was restarted; 6 restarts in all",
+            "- 03:20 UTC node n1: Ready became False (KubeletNotReady)"])
+
+    def test_tool_says_when_there_is_nothing_to_compare(self):
+        box = tools.Toolbox(self.s, clusters={})
+        with mock.patch.object(history, "take", lambda b: {"time": 5000, "docker": {}, "k8s": {}}):
+            self.assertIn("Nothing was recorded before now", box.what_changed("1h"))
+            with self.assertRaises(tools.BadInput):
+                box.what_changed("yesterday")
+
+
+class Watch(unittest.TestCase):
+    def run_watch(self, rounds_of_overview, argv=()):
+        box = mock.Mock(clusters={}, roles={})
+        box._disks.return_value = [(95, "/data: 95% used, 1.0 GB free of 20.0 GB"), (40, "/: 40% used")]
+        box._meminfo.return_value = {"MemAvailable": 8000, "MemTotal": 16000}
+        box.overview.side_effect = rounds_of_overview
+        out, logged = io.StringIO(), []
+        with redirect_stdout(out), mock.patch.object(history, "record", lambda b: None):
+            code = watch.main(Settings(), box, list(argv), logged.append, sleep=lambda s: None, rounds=len(rounds_of_overview))
+        return code, out.getvalue(), logged
+
+    def test_speaks_only_on_change(self):
+        bad = "DOCKER: 1 of 2 containers running; 1 need a look\n- relay: Exited (1) {} minutes ago"
+        code, out, logged = self.run_watch([
+            "DOCKER: 2 of 2 containers running; 0 need a look", bad.format(2), bad.format(9),
+            "DOCKER: 2 of 2 containers running; 0 need a look"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count("PROBLEM   host: disk /data: 95% used"), 1)
+        self.assertEqual(out.count("NEW       docker: relay: Exited (1) 2 minutes ago"), 1)
+        self.assertEqual(out.count("NEW "), 1)  # the same problem getting older is not news
+        self.assertEqual(out.count("OK AGAIN  docker: relay"), 1)
+        self.assertIn("Watch found a new problem: docker: relay: Exited (1) 2 minutes ago", logged)
+
+    def test_unreachable_cluster_is_a_problem(self):
+        _, out, _ = self.run_watch(["KUBERNETES vks: not reachable: the login was refused: the token has expired or is wrong."])
+        self.assertIn("PROBLEM   kubernetes vks: not reachable: the login was refused", out)
+
+    def test_a_failed_round_does_not_end_the_watch(self):
+        _, out, _ = self.run_watch([RuntimeError("docker is down"), "DOCKER: 1 of 1 containers running; 0 need a look"])
+        self.assertIn("This round of checks failed (docker is down)", out)
+
+    def test_bad_arguments(self):
+        self.assertEqual(self.run_watch([], argv=["--often"])[0], 2)
+
+
+class Report(unittest.TestCase):
+    def test_report_uses_the_conversation_and_is_saved(self):
+        s = Settings(llm_url="http://x", llm_model="m", kube_dir="/none", log_dir=tempfile.mkdtemp())
+        ui = UI()
+        ui.spinner, ui.done = mock.Mock(), lambda: None
+        sess = engine.Session(s, ui)
+        self.assertIsNone(sess.report())
+        self.assertIn("Nothing to report yet", ui.notices[0])
+        sess.messages += [{"role": "user", "content": "why is relay down?"}, call("docker_list"),
+                          {"role": "tool", "tool_call_id": "1", "content": "relay Exited (1)"},
+                          {"role": "assistant", "content": "It exited."}]
+        seen = {}
+
+        def fake(settings, messages, tools=None, **kw):
+            seen["last"], seen["tools"] = messages[-1]["content"], tools
+            return {"role": "assistant", "content": "SUMMARY\nrelay exited."}, "stop"
+        out = io.StringIO()
+        with mock.patch.object(llm, "chat", fake), redirect_stdout(out):
+            cli.report(s, sess, ui)
+        self.assertIn("incident report", seen["last"])
+        self.assertIsNone(seen["tools"])
+        name = os.listdir(os.path.join(s.log_dir, "reports"))[0]
+        self.assertIn(f"Saved in the log folder: reports/{name}", out.getvalue())
+        with open(os.path.join(s.log_dir, "reports", name)) as f:
+            text = f.read()
+        self.assertIn("SUMMARY\nrelay exited.", text)
+        self.assertIn("Check it before passing it on", text)
 
 
 class Launcher(unittest.TestCase):

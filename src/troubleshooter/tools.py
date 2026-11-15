@@ -40,11 +40,51 @@ try:
 except OSError as e:
     print(f"TCP: could not connect to port {port}: {e}")
 """
+# Inside a pod there is no helper image, so use whatever the image has. $1 is the host, $2 the port.
+POD_NET_TEST = r"""
+h="$1"; p="$2"
+if command -v getent >/dev/null 2>&1; then
+  a=$(getent hosts "$h" | cut -d' ' -f1 | sort -u | tr '\n' ' ')
+  if [ -n "$a" ]; then echo "DNS: $h is $a"; else echo "DNS failed for $h: no address found"; fi
+elif command -v nslookup >/dev/null 2>&1; then
+  if nslookup "$h" >/dev/null 2>&1; then echo "DNS: $h resolves"; else echo "DNS failed for $h"; fi
+else
+  echo "DNS: no lookup tool in this image; the connection test below resolves the name itself"
+fi
+t=""; command -v timeout >/dev/null 2>&1 && t="timeout 6"
+if command -v bash >/dev/null 2>&1; then
+  how=bash; e=$($t bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$h" "$p" 2>&1); rc=$?
+elif command -v nc >/dev/null 2>&1; then
+  how=nc; e=$(nc -z -w 5 "$h" "$p" 2>&1); rc=$?
+elif command -v python3 >/dev/null 2>&1; then
+  how=python3; e=$(python3 -c 'import socket,sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 5)' "$h" "$p" 2>&1 | tail -1); rc=$?
+  [ -n "$e" ] && rc=1
+elif command -v curl >/dev/null 2>&1; then
+  how=curl; e=$(curl -s -S -o /dev/null --connect-timeout 5 --max-time 6 "telnet://$h:$p" </dev/null 2>&1); rc=$?
+  [ "$rc" = 28 ] && ! echo "$e" | grep -qi "connect" && rc=0
+elif command -v wget >/dev/null 2>&1; then
+  how=wget; e=$(wget -q -T 5 -O /dev/null "http://$h:$p/" 2>&1); rc=$?
+  echo "$e" | grep -qiE 'refused|timed out|bad address|unreachable|resolve|no route' || rc=0
+else
+  echo "TCP: this image has no tool that can open a connection (looked for bash, nc, python3, curl, wget)"; exit 0
+fi
+e=$(echo "$e" | tail -1 | sed 's/.*: //')
+if [ "$rc" = 0 ]; then echo "TCP: connected to $h port $p (tested with $how)"
+elif [ "$rc" = 124 ]; then echo "TCP: could not connect to $h port $p: timed out after 6 s (tested with $how)"
+else echo "TCP: could not connect to $h port $p: ${e:-refused or unreachable} (tested with $how)"; fi
+"""
 SINCE = re.compile(r"^(\d{1,5})([smhd])$")
 NO_NAMESPACE = ("nodes", "namespaces", "persistentvolumes", "storageclasses")
 SECRET_KIND = re.compile(r"^secrets?(\.|$)", re.I)
 SCALABLE = ("deployments", "statefulsets")
 RESTARTABLE = ("deployments", "statefulsets", "daemonsets")
+# VMware VKS: the Supervisor holds each cluster, its machines and their VMs as resources.
+CAPI = "cluster.x-k8s.io"
+VKS_KINDS = {"clusters": "clusters." + CAPI, "planes": "kubeadmcontrolplanes.controlplane." + CAPI,
+             "pools": "machinedeployments." + CAPI, "machines": "machines." + CAPI,
+             "vms": "virtualmachines.vmoperator.vmware.com"}
+CLUSTER_LABEL = CAPI + "/cluster-name"
+BUSY = {"Deleting", "Paused", "Remediating", "RollingOut", "ScalingUp", "ScalingDown", "Stalled"}  # True = worth saying
 SECRET_FILE = re.compile(r"(^|/)(\.env[^/]*|.*\.(key|pem|p12|pfx|jks|keystore|kdbx)|id_(rsa|dsa|ecdsa|ed25519)|"
                          r"shadow|gshadow|credentials?(\.\w+)?|\.netrc|\.pgpass|kubeconfig|client\.config)$", re.I)
 REAL_FS = ("ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "vfat", "nfs", "nfs4", "cifs", "ceph", "f2fs")
@@ -195,6 +235,33 @@ class Cluster:
     namespace: str = ""   # the context's own namespace, used when none is given
 
 
+def conditions(obj):
+    """What a resource says is wrong with itself: each condition that is not as it should be."""
+    status = obj.get("status") or {}
+    found = {}
+    for c in (status.get("conditions") or []) + ((status.get("v1beta2") or {}).get("conditions") or []):
+        kind, state = c.get("type", "?"), c.get("status")
+        if (state == "True") == (kind in BUSY) and kind not in found:
+            why = " ".join(x for x in (c.get("reason"), (c.get("message") or "").strip()) if x)
+            found[kind] = f"{kind}={state}" + (f" ({why[:300]})" if why else "")
+    return list(found.values())
+
+
+def vm_address(vm):
+    status = vm.get("status") or {}
+    return (status.get("network") or {}).get("primaryIP4") or status.get("vmIp") or ""
+
+
+def selector(labels):
+    """A label selector for kubectl -l, from a workload's or service's own labels."""
+    if not labels:
+        return ""
+    for k, v in labels.items():
+        if not re.match(r"^[A-Za-z0-9_.\-/]{1,253}$", k) or not re.match(r"^[A-Za-z0-9_.\-]{0,63}$", str(v)):
+            raise BadInput("The selector has a label kubectl can't take.")
+    return ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
+
+
 def find_clusters(kube_dir):
     """Your current login (through ./ts), then every context of every file in the folder.
 
@@ -231,6 +298,7 @@ class Toolbox:
         ids = tuple(self.clusters)
         current = re.sub(r"[^A-Za-z0-9_.\-]", "-", os.environ.get("KUBE_CURRENT", ""))
         self.active = current if current in self.clusters else next(iter(ids), None)
+        self.roles = {}  # context -> "supervisor" or "workload", once known
         which = P("string", "Context (default: the active one)", False, ids)
         self.tools = {}
         for t in self._define():
@@ -265,7 +333,9 @@ class Toolbox:
         """Every context, which is active, and whether its login works right now."""
         def state(cid):
             r = run(self._kubectl(cid, "get", "--raw", "/version"), timeout=10)
-            return "ok" if r.ok else kube_error(r.text)
+            if not r.ok:
+                return kube_error(r.text)
+            return "ok, supervisor (manages VKS clusters)" if self._role(cid) == "supervisor" else "ok"
         with ThreadPoolExecutor(max_workers=8) as pool:
             states = list(pool.map(state, self.clusters))
         rows = []
@@ -273,6 +343,30 @@ class Toolbox:
             mark = "* " if c.id == self.active else "  "
             rows.append(f"{mark}{c.id}" + (f" (namespace {c.namespace})" if c.namespace else "") + f": {st}")
         return "\n".join(rows)
+
+    def _role(self, cid):
+        """A Supervisor is a context that offers the Cluster API. Asked once per context."""
+        if cid not in self.roles:
+            r = run(self._kubectl(cid, "get", "--raw", "/apis/" + CAPI), timeout=10)
+            if r.ok:
+                self.roles[cid] = "supervisor"
+            elif "NotFound" in r.text or "not find" in r.text:
+                self.roles[cid] = "workload"
+        return self.roles.get(cid)
+
+    def _supervisor(self, cid):
+        """The context to ask about VKS clusters: the one given, else the active one, else the only Supervisor."""
+        if cid or self._role(self.active) == "supervisor":
+            return self._cluster(cid).id, ""
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(self._role, self.clusters))
+        found = [c for c in self.clusters if self.roles.get(c) == "supervisor"]
+        if len(found) == 1:
+            return found[0], f"(Asked the Supervisor context {found[0]}; the active context is {self.active}.)\n"
+        if found:
+            raise BadInput(f"Several Supervisor contexts: {', '.join(found)}. Give one as cluster.")
+        raise BadInput("None of your contexts is a Supervisor, so the VMware side can't be seen from here. "
+                       "The operator needs to log in to the Supervisor with kubectl and start ./ts again.")
 
     def k8s_use_context(self, context):
         """Only for this chat: the kubeconfig and other terminals are not touched."""
@@ -622,6 +716,215 @@ class Toolbox:
             args += ["-c", name(container, "container")]
         return run(self._kubectl(cluster, *args, "--", "sh", "-c", CHECKS[check])).text
 
+    def pod_net_test(self, cluster, pod, namespace, host, port, container):
+        if not 1 <= port <= 65535:
+            raise BadInput("port must be 1 to 65535.")
+        args = ["exec", name(pod, "pod"), "-n", self._ns1(cluster, namespace)]
+        if container:
+            args += ["-c", name(container, "container")]
+        r = run(self._kubectl(cluster, *args, "--", "sh", "-c", POD_NET_TEST, "sh", name(host, "host"), str(port)), timeout=40)
+        if re.search(r'"sh": executable file not found|exec: "sh"|no such file or directory', r.text):
+            return ("This container has no shell, so nothing can be run inside it. "
+                    "Run the test from another pod in the same namespace instead.")
+        return r.text
+
+    def _json(self, cluster, *args):
+        """(object, problem) for a kubectl get -o json."""
+        r = run(self._kubectl(cluster, "get", *args, "-o", "json"), parsed=True)
+        if not r.ok:
+            return {}, kube_error(r.text)
+        try:
+            return json.loads(r.text), ""
+        except ValueError:
+            return {}, "the answer could not be read"
+
+    def k8s_workload_logs(self, cluster, kind, resource, namespace, tail, since_, match, previous):
+        """Logs of every pod of a workload at once, each line marked with its pod."""
+        ns = self._ns1(cluster, namespace)
+        obj, problem = self._json(cluster, kind, name(resource, "resource"), "-n", ns)
+        if problem:
+            return problem
+        labels = selector(((obj.get("spec") or {}).get("selector") or {}).get("matchLabels"))
+        if not labels:
+            raise BadInput(f"{kind} {resource} selects its pods without plain labels. Use k8s_logs on each pod.")
+        args = ["logs", "-l", labels, "-n", ns, "--prefix", "--all-containers=true", "--timestamps",
+                "--max-log-requests=40", f"--tail={lines(tail, 50, 500)}"]
+        if previous:
+            args.append("--previous")
+        if since_:
+            args.append(f"--since={since(since_)}")
+        r = run(self._kubectl(cluster, *args), timeout=60)
+        return grep(r.text, match) or f"No log lines from the pods of {kind} {resource} for that period."
+
+    def k8s_service_check(self, cluster, service, namespace):
+        """Follow a service to what answers behind it, and say where the chain breaks."""
+        ns = self._ns1(cluster, namespace)
+        svc, problem = self._json(cluster, "services", name(service, "service"), "-n", ns)
+        if problem:
+            return problem
+        spec = svc.get("spec") or {}
+        ports = spec.get("ports") or []
+        shown = ", ".join(f"{p.get('port')} to {p.get('targetPort', p.get('port'))}" for p in ports) or "none"
+        text = [f"SERVICE {ns}/{service}: type {spec.get('type', 'ClusterIP')}, cluster IP {spec.get('clusterIP')}, "
+                f"ports {shown}"]
+        bad = []
+        if spec.get("type") == "ExternalName":
+            return text[0] + f"\nIt only points to the outside name {spec.get('externalName')}: test that with dns_lookup."
+        if spec.get("type") == "LoadBalancer":
+            found = [i.get("ip") or i.get("hostname") for i in ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []]
+            if found:
+                text.append(f"External address: {', '.join(found)}")
+            else:
+                bad.append("no external address yet: the load balancer has not been provided. "
+                           "See k8s_describe on the service for the reason.")
+        slices, problem = self._json(cluster, "endpointslices", "-n", ns, "-l", f"kubernetes.io/service-name={service}")
+        if problem:
+            text.append(f"Endpoints could not be read: {problem}")
+        else:
+            ends = [e for s in slices.get("items") or [] for e in s.get("endpoints") or []]
+            ready = sum((e.get("conditions") or {}).get("ready") is not False for e in ends)
+            text.append(f"Endpoints: {ready} ready, {len(ends) - ready} not ready")
+            if not ready:
+                bad.append("no ready endpoints: connections to this service are refused or hang")
+        labels = selector(spec.get("selector"))
+        if not labels:
+            text.append("It has no selector, so its endpoints are set by hand or by another controller.")
+            return "\n".join(text + [f"- {b}" for b in bad])
+        pods, problem = self._json(cluster, "pods", "-n", ns, "-l", labels)
+        items = pods.get("items") or []
+        if problem:
+            text.append(f"Pods could not be read: {problem}")
+        elif not items:
+            bad.append(f"the selector {labels} matches no pods in namespace {ns}: compare it with the pods' labels")
+        else:
+            up = [p for p in items if any(c.get("type") == "Ready" and c.get("status") == "True"
+                                           for c in (p.get("status") or {}).get("conditions") or [])]
+            text.append(f"Pods matching {labels}: {len(items)}, of which {len(up)} ready")
+            for p in items:
+                if p not in up:
+                    why = self._pod_trouble(p) or "not ready (failing its readiness check?)"
+                    bad.append(f"pod {p['metadata']['name']} on node {(p.get('spec') or {}).get('nodeName', '?')}: {why}")
+            declared = [c for p in items for box in (p.get("spec") or {}).get("containers") or [] for c in box.get("ports") or []]
+            for port in ports:
+                target = port.get("targetPort", port.get("port"))
+                if isinstance(target, str) and not any(c.get("name") == target for c in declared):
+                    bad.append(f"targetPort '{target}' is a port name that no pod defines, so traffic goes nowhere")
+                elif isinstance(target, int) and declared and not any(c.get("containerPort") == target for c in declared):
+                    seen = ", ".join(sorted({str(c.get("containerPort")) for c in declared}))
+                    bad.append(f"targetPort {target} is not a port the pods declare ({seen}). Declaring is optional: "
+                               f"check what the app listens on with pod_check listening_ports")
+            hosts = {(p.get("spec") or {}).get("nodeName") for p in items}
+            nodes, _ = self._json(cluster, "nodes")
+            for n in nodes.get("items") or []:
+                state = next((c["status"] for c in n["status"].get("conditions", []) if c["type"] == "Ready"), "?")
+                if n["metadata"]["name"] in hosts and state != "True":
+                    bad.append(f"node {n['metadata']['name']}, which runs some of these pods: Ready={state}")
+        if not bad:
+            text.append("Nothing wrong found in the chain. If a client still can't connect, test from the client "
+                        "with pod_net_test, and check network policies.")
+        return "\n".join(text + [f"- {b}" for b in bad])
+
+    def what_changed(self, since_):
+        from . import history  # it needs this module, so it is loaded late
+        m = SINCE.match(since_ or "1h")
+        if not m:
+            raise BadInput("since must look like 30m, 2h or 1d.")
+        return history.what_changed(self, min(int(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]], 7 * 86400))
+
+    # ---------- VMware VKS, seen from the Supervisor ----------
+    def _vks_list(self, cid, kind, namespace):
+        """(items, problem). Without the right to list everywhere, falls back to the context's own namespace."""
+        r = run(self._kubectl(cid, "get", kind, "-o", "json", *self._ns(namespace)), parsed=True)
+        if not r.ok and "Forbidden" in r.text and not namespace and self._cluster(cid).namespace:
+            r = run(self._kubectl(cid, "get", kind, "-o", "json", "-n", self._ns1(cid, None)), parsed=True)
+        if not r.ok:
+            return [], kube_error(r.text)
+        try:
+            return json.loads(r.text).get("items") or [], ""
+        except ValueError:
+            return [], "the answer could not be read"
+
+    def vks_cluster_health(self, cluster, namespace, name_):
+        cid, note = self._supervisor(cluster)
+        if name_:
+            name(name_, "cluster name")
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            got = dict(zip(VKS_KINDS, pool.map(lambda k: self._vks_list(cid, k, namespace), VKS_KINDS.values())))
+        clusters, problem = got["clusters"]
+        if problem:
+            return note + f"Could not list VKS clusters in context {cid}: {problem}"
+        clusters = [c for c in clusters if not name_ or c["metadata"]["name"] == name_]
+        if not clusters:
+            where = f"namespace {namespace}" if namespace else "the namespaces this login can see"
+            return note + f"No VKS cluster{' named ' + name_ if name_ else ''} in {where} (context {cid})."
+        text = [note + f"Supervisor context {cid}: {len(clusters)} VKS cluster(s)."]
+        text += [f"Could not read {k}: {p}" for k, (_, p) in got.items() if p]
+        spaces = []
+        for c in clusters:
+            text += ["", *self._vks_cluster(c, got)]
+            if c["metadata"]["namespace"] not in spaces:
+                spaces.append(c["metadata"]["namespace"])
+        for ns in spaces[:5]:
+            r = run(self._kubectl(cid, "get", "events", "-n", ns, "--sort-by=.lastTimestamp",
+                                  "--field-selector=type=Warning"))
+            rows = [x for x in r.text.splitlines()[1:] if x.strip()][-12:] if r.ok else []
+            if rows:
+                text += ["", f"Newest warning events in namespace {ns}:", *rows]
+        return "\n".join(text)
+
+    @staticmethod
+    def _vks_cluster(c, got):
+        """One cluster, top down: the cluster, its control plane, worker pools, machines and their VMs."""
+        ns, cname = c["metadata"]["namespace"], c["metadata"]["name"]
+
+        def mine(key):
+            return [o for o in got[key][0] if o["metadata"].get("namespace") == ns and (
+                (o["metadata"].get("labels") or {}).get(CLUSTER_LABEL) == cname
+                or (o.get("spec") or {}).get("clusterName") == cname)]
+
+        def count(o):
+            spec, status = o.get("spec") or {}, o.get("status") or {}
+            return status.get("readyReplicas", 0), spec.get("replicas", status.get("replicas", "?"))
+
+        rows = []
+        phase = (c.get("status") or {}).get("phase", "unknown")
+        version = ((c.get("spec") or {}).get("topology") or {}).get("version", "")
+        for bad in ([f"phase {phase}"] if phase != "Provisioned" else []) + conditions(c):
+            rows.append(f"- cluster: {bad}")
+        for o in mine("planes"):
+            ready, want = count(o)
+            for bad in ([f"{ready} of {want} ready"] if ready != want else []) + conditions(o):
+                rows.append(f"- control plane {o['metadata']['name']}: {bad}")
+        for o in mine("pools"):
+            ready, want = count(o)
+            for bad in ([f"{ready} of {want} ready"] if ready != want else []) + conditions(o):
+                rows.append(f"- worker pool {o['metadata']['name']}: {bad}")
+        machines = mine("machines")
+        vms = {v["metadata"]["name"]: v for v in got["vms"][0] if v["metadata"].get("namespace") == ns}
+        running = 0
+        for m in machines:
+            status, mname = m.get("status") or {}, m["metadata"]["name"]
+            bad = conditions(m)
+            if status.get("phase") == "Running" and not bad:
+                running += 1
+            else:
+                node = (status.get("nodeRef") or {}).get("name") or "no node yet"
+                rows.append(f"- machine {mname} (node {node}): phase {status.get('phase', 'unknown')}"
+                            + "".join(f"; {b}" for b in bad))
+            vm = vms.get(((m.get("spec") or {}).get("infrastructureRef") or {}).get("name") or mname)
+            if vm is None:
+                if not got["vms"][1]:
+                    rows.append(f"  - VM of {mname}: none found in namespace {ns}")
+                continue
+            power = (vm.get("status") or {}).get("powerState", "unknown")
+            wrong = ([f"power {power}"] if power.lower() != "poweredon" else []) \
+                + ([] if vm_address(vm) else ["no IP address"]) + conditions(vm)
+            if wrong:
+                rows.append(f"  - VM {vm['metadata']['name']}: " + "; ".join(wrong))
+        head = f"VKS CLUSTER {ns}/{cname}" + (f" ({version})" if version else "") \
+            + f": {running} of {len(machines)} machines running; "
+        return [head + (f"{len(rows)} need a look" if rows else "nothing wrong found")] + rows[:60]
+
     # ---------- Host ----------
     def host_status(self):
         return self._host_summary()
@@ -876,6 +1179,11 @@ class Toolbox:
             t("overview", "Health of the host, Docker, Swarm and the active Kubernetes context in one call. Start here.",
               "Checked overall health", self.overview,
               {"all_clusters": P("boolean", "Check every context, not just the active one")}),
+            t("what_changed", "What is different from a while ago: images, replica counts, restarts, nodes, settings "
+              "(configmaps), containers, and on VMware VKS the machines and VMs; then the rollouts and restarts the "
+              "cluster itself recorded. Use it early when something worked before: most faults follow a change.",
+              "Looked at what changed in the last {since}", lambda since: self.what_changed(since),
+              {"since": P("string", "How far back, e.g. 30m, 2h, 1d (default 1h, most 7d)")}),
             t("k8s_contexts", "List Kubernetes contexts, which is active (*), and whether each login works.",
               "Listed Kubernetes contexts", self.k8s_contexts, needs_kube=True, per_cluster=False),
             t("k8s_use_context", "Switch the active context for this chat. The kubeconfig is not changed.",
@@ -930,6 +1238,29 @@ class Toolbox:
               {"what": P("string", "nodes or pods", True, ("nodes", "pods")), "namespace": ns}, needs_kube=True),
             t("pod_check", "Look inside a running pod with a fixed read-only check.", "Checked {check} inside pod {pod}",
               self.pod_check, {"pod": pod, "namespace": ns1, "check": chk, "container": P("string", "Container")}, needs_kube=True),
+            t("pod_net_test", "Test DNS and a TCP connection as seen from inside a running pod, with whatever the image has.",
+              "Tested {host}:{port} from inside pod {pod}",
+              lambda cluster, pod, namespace, host, port, container: self.pod_net_test(cluster, pod, namespace, host, port, container),
+              {"pod": pod, "namespace": ns1, "host": P("string", "Host name or address", True),
+               "port": P("integer", "Port", True), "container": P("string", "Container")}, needs_kube=True),
+            t("k8s_workload_logs", "Logs of all pods of a deployment, statefulset or daemonset in one call, each line "
+              "marked with its pod.", "Read logs of all pods of {kind} {name}",
+              lambda cluster, kind, name, namespace, tail, since, match, previous:
+              self.k8s_workload_logs(cluster, kind, name, namespace, tail, since, match, previous),
+              {"kind": P("string", "Kind", True, RESTARTABLE), "name": res, "namespace": ns1,
+               "tail": P("integer", "Newest lines per container (default 50)"), "since": when, "match": match,
+               "previous": P("boolean", "Logs of the previous run")}, needs_kube=True),
+            t("k8s_service_check", "Follow a service to what answers behind it: its ports, endpoints, pods and their "
+              "nodes, and where the chain breaks. Use when something can't reach a service.",
+              "Checked the chain behind service {service}", self.k8s_service_check,
+              {"service": P("string", "Service name", True), "namespace": ns1}, needs_kube=True),
+            t("vks_cluster_health", "VMware VKS, from the Supervisor: each cluster's control plane, worker pools, machines "
+              "and node VMs, listing only what is not ready, with the reason. Use for a node that is NotReady or "
+              "missing, or a stuck upgrade or scale-out. Finds the Supervisor context itself.",
+              "Checked VKS cluster health {name}",
+              lambda cluster, namespace, name: self.vks_cluster_health(cluster, namespace, name),
+              {"namespace": P("string", "vSphere Namespace (default: all you can see)"),
+               "name": P("string", "One VKS cluster (default: all)")}, needs_kube=True),
             t("host_status", "Load, memory, swap and disks of the machine running this tool, not of cluster nodes.", "Read host status", self.host_status),
             t("host_processes", "Top host processes.", "Read top host processes", self.host_processes,
               {"sort": P("string", "cpu or memory", enum=("cpu", "memory"))}),

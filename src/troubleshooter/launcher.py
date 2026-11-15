@@ -5,6 +5,7 @@ on Python 3.6 or newer, as found on older hosts.
 
   - Starts one kubectl proxy per context on 127.0.0.1, as you, so the container can use your logins.
     They stop when this ends.
+  - ./ts watch: stopping it, or losing its terminal, stops the watch in the container too.
   - ./ts learn: saves the runbook as you, in runbooks/<this host>/, so it works on a shared folder
     where the container's root can't write. Stopping it stops the work in the container too.
 """
@@ -159,6 +160,19 @@ def learn(signals, proxies, args):
     return 0 if saved else (code or 1)
 
 
+def watch(signals, proxies, args):
+    """Runs until stopped. Whatever ends this, the watch in the container is ended too."""
+    run_id = str(os.getpid())
+    extra = ["-e", "WATCH_RUN=" + run_id] + ([] if sys.stdin.isatty() else ["-T"])
+    try:
+        code = signals.call(exec_args(proxies, *extra) + args)
+        return 130 if signals.stopped and code else code
+    finally:
+        subprocess.call(["docker", "compose", "exec", "-T", "troubleshooter", "sh", "-c",
+                         "kill $(cat /tmp/watch.{0}) 2>/dev/null; rm -f /tmp/watch.{0}".format(run_id)],
+                        stderr=subprocess.DEVNULL)
+
+
 def main():
     args = sys.argv[1:]
     os.chdir(HOME)
@@ -172,6 +186,8 @@ def main():
         proxies.start()
         if args[:1] == ["learn"]:
             return learn(signals, proxies, args)
+        if args[:1] == ["watch"]:
+            return watch(signals, proxies, args)
         code = signals.call(exec_args(proxies) + args)
         return 130 if signals.stopped and code else code
     except Stopped:
