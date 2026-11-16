@@ -1,6 +1,7 @@
 """Settings, read from environment variables set in compose.yaml (secrets in .env)."""
 import dataclasses
 import os
+import socket
 from dataclasses import dataclass, field
 
 
@@ -40,6 +41,17 @@ class Settings:
     learn_llm_model: str = ""
     learn_llm_api_key: str = field(default="", repr=False)
     record_minutes: int = 5
+    kubernetes: bool = True
+    hub_host: str = ""            # "name" or "name=address"; empty = this host stands alone
+    agent_hosts: tuple = ()       # each "name" or "name=address"
+    agent_port: int = 8001
+    web_port: int = 9001
+    agent_key: str = field(default="", repr=False)
+    tls_key: str = field(default="", repr=False)      # the private key, base64 of its PEM
+    tls_cert: str = "/certs/troubleshooter-cert.pem"
+    web_users: str = field(default="", repr=False)    # "name:hash,name:hash"
+    web_tls_key: str = field(default="", repr=False)  # your own certificate's key for the page, base64 of its PEM
+    web_cert: str = "/certs/web-cert.pem"
     helper_image: str = "troubleshooter-runtime:2"
 
 
@@ -71,6 +83,17 @@ def load():
         learn_llm_model=os.environ.get("LEARN_LLM_MODEL", ""),
         learn_llm_api_key=os.environ.get("LEARN_LLM_API_KEY", ""),
         record_minutes=int(os.environ.get("RECORD_MINUTES", "5") or 0),
+        kubernetes=_flag("KUBERNETES", "on"),
+        hub_host=os.environ.get("HUB_HOST", "").strip(),
+        agent_hosts=tuple(_list("AGENT_HOSTS")),
+        agent_port=int(os.environ.get("AGENT_PORT", "8001") or 8001),
+        web_port=int(os.environ.get("WEB_PORT", "9001") or 9001),
+        agent_key=os.environ.get("AGENT_KEY", ""),
+        tls_key=os.environ.get("TLS_KEY", ""),
+        tls_cert=os.environ.get("TLS_CERT", "/certs/troubleshooter-cert.pem"),
+        web_users=os.environ.get("WEB_USERS", ""),
+        web_tls_key=os.environ.get("WEB_TLS_KEY", ""),
+        web_cert=os.environ.get("WEB_CERT", "/certs/web-cert.pem"),
         helper_image=os.environ.get("HELPER_IMAGE", "troubleshooter-runtime:2"),
     )
 
@@ -85,3 +108,32 @@ def for_learning(s):
     url = s.learn_llm_url or s.llm_url
     key = s.learn_llm_api_key or (s.llm_api_key if url == s.llm_url else "")
     return dataclasses.replace(s, llm_url=url, llm_model=s.learn_llm_model or s.llm_model, llm_api_key=key)
+
+
+def short(host):
+    """A host's name as compared here: the part before the first dot, in lower case."""
+    return host.split("=")[0].strip().split(".")[0].lower()
+
+
+def here():
+    return short(socket.gethostname())
+
+
+def role(s):
+    """alone: no hub is set. hub: this host is it. agent: another host is."""
+    if not s.hub_host:
+        return "alone"
+    return "hub" if short(s.hub_host) == here() else "agent"
+
+
+def address(entry):
+    """Where to reach a host written as "name" or "name=address"."""
+    name, _, where = entry.partition("=")
+    return (where or name).strip()
+
+
+def agents(s):
+    """{name: address} of the other hosts the hub may ask. Empty unless this host is the hub."""
+    if role(s) != "hub":
+        return {}
+    return {short(e): address(e) for e in s.agent_hosts if short(e) != here()}

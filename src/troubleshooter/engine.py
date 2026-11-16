@@ -68,6 +68,15 @@ Kubernetes contexts you can reach: {clusters}. The active one at the start is {a
   Fix tools are refused on a Supervisor context: VMware manages what is there.
 - If a call says Forbidden, you lack that permission: report it, don't work around it."""
 
+HOSTS = """
+
+You are on the hub host {here}. You can also look at these other hosts: {others}. The Docker, Swarm, host and
+file tools take a host argument; without it they look at {here}.
+- Containers, files and logs on different hosts are different things. Say which host each finding is from.
+- For a question about "everything", look at each host: overview and docker_list take host too.
+- You can only change things on {here}. For a fix on another host, tell the operator to run ./ts there.
+- If a host did not answer, say so and carry on with the others."""
+
 BOOKS = """
 
 Runbooks exist for these apps: {apps}. When a question touches one, read it first with read_runbook, as it says
@@ -122,6 +131,8 @@ class Session:
         count = len(cases.all_cases(self.s))
         notes = CASES.format(count=count) if count else "\n\nWhen a problem is solved and the fix is confirmed, " \
                                                          "tell the operator they can type /case to save it for later chats."
+        if self.box.agents:
+            kube += HOSTS.format(here=self.box.here, others=", ".join(self.box.agents))
         self.messages = [{"role": "system", "content": PROMPT.format(host=here, kube=kube, books=books + notes)}]
 
     def ask(self, question):
@@ -242,6 +253,9 @@ class Session:
             self.ui.step(say)
             text = self.box.out(str(tool.fn(**args)) or "(no output)")
             self.log(f"{say} ({len(text)} characters back)")
+            shown = getattr(self.ui, "result", None)  # a page shows each step's full output; a terminal doesn't
+            if shown:
+                shown(text)
             return text
         except BadInput as e:
             self.log(f"Refused a {tool.name} request: {e}")

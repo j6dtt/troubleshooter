@@ -328,7 +328,12 @@ def differences(old, new):
 
 # ---------- what the cluster itself remembers ----------
 def timeline(box, cid, start):
-    """Events since `start` that Kubernetes still records: rollouts, container restarts, node changes."""
+    """Lines for what Kubernetes itself still records since `start`."""
+    return [f"- {clock(when)[11:]} {text}" for when, text in timeline_rows(box, cid, start)]
+
+
+def timeline_rows(box, cid, start):
+    """[(when, text)] since `start`: rollouts, container restarts, node changes."""
     rows = []
     sets = _items(box, cid, "replicasets.apps") or []
     by_owner = {}
@@ -371,7 +376,7 @@ def timeline(box, cid, start):
             when = stamp(c.get("lastTransitionTime"))
             if when and when >= start:
                 rows.append((when, f"node {o['metadata']['name']}: {c.get('type')} became {c.get('status')} ({c.get('reason')})"))
-    return [f"- {clock(when)[11:]} {text}" for when, text in sorted(rows)]
+    return sorted(rows)
 
 
 def what_changed(box, since_seconds):
@@ -429,3 +434,49 @@ def record_forever(box, minutes, sleep=time.sleep, rounds=None):
         record(box)
         done += 1
         sleep(minutes * 60)
+
+
+# ---------- for the timeline ----------
+_MEMO = {}
+
+
+def events(settings, since):
+    """[{"time", "where", "text"}]: each difference between one snapshot and the next, since `since`."""
+    names = _files(settings)
+    start = next((i for i, n in enumerate(names) if _taken(n) >= since), len(names))
+    names = names[max(start - 1, 0):]
+    found, last = [], None
+    for name in names:
+        if last is not None:
+            pair = (last, name)
+            if pair not in _MEMO:
+                old, new = _read(settings, last), _read(settings, name)
+                _MEMO[pair] = differences(old, new) if old and new else []
+                if len(_MEMO) > 5000:
+                    _MEMO.pop(next(iter(_MEMO)))
+            where = ""
+            for row in _MEMO[pair]:
+                if row.startswith("- "):
+                    found.append({"time": _taken(name), "where": where, "text": row[2:]})
+                else:
+                    where = "Docker" if row == "DOCKER" else row.replace("KUBERNETES ", "")
+        last = name
+    return found[-500:]
+
+
+def coverage(settings, since):
+    """[[from, to]]: the stretches of time when the state was being written down."""
+    spans = []
+    for name in _files(settings):
+        try:
+            seen = os.path.getmtime(os.path.join(folder(settings), name))
+        except OSError:
+            continue
+        taken = _taken(name)
+        if seen < since:
+            continue
+        if spans and taken - spans[-1][1] <= 2 * EVERY:
+            spans[-1][1] = max(spans[-1][1], seen)
+        else:
+            spans.append([max(taken, since), max(seen, taken)])
+    return [[int(a), int(b)] for a, b in spans]

@@ -63,8 +63,27 @@ x-settings:
   # "what changed". Runs with no chat open. "0" turns it off.
   record-minutes: &record-minutes "5"
 
+  # --- Several hosts, one web page ---
+  # Empty hub-host = this host stands alone: no page, no agents.
+  # hub-host: the one host that serves the page, watches
+  # Kubernetes, and may look at the others. Write it as the
+  # command "hostname" prints it there.
+  hub-host: &hub-host ""
+  # The other hosts, separated by commas. Each runs as an agent
+  # and answers only the hub. "name=address" if a name does not
+  # resolve, e.g. "host-02,host-03=10.0.0.13".
+  agent-hosts: &agent-hosts ""
+  # Port the agents listen on, and the page's own port (https).
+  agent-port: &agent-port "8001"
+  web-port: &web-port "9001"
+  # Keys and page accounts are made by ./ts setup and
+  # ./ts user add, which write them to .env.
+
   # --- Kubernetes ---
-  # No setting: one kubeconfig per cluster in ./kube,
+  # "off" = Docker and host only: no cluster tools, no kubectl
+  # proxies, nothing about clusters anywhere.
+  kubernetes: &kubernetes "on"
+  # Clusters need no setting: one kubeconfig per cluster in ./kube,
   # named after the cluster. Make them with
   # scripts/make-kubeconfig.sh. Empty = no Kubernetes.
 
@@ -124,6 +143,11 @@ services:
       LEARN_LLM_URL: *learn-llm-url
       LEARN_LLM_MODEL: *learn-llm-model
       RECORD_MINUTES: *record-minutes
+      KUBERNETES: *kubernetes
+      HUB_HOST: *hub-host
+      AGENT_HOSTS: *agent-hosts
+      AGENT_PORT: *agent-port
+      WEB_PORT: *web-port
     # Records in the background. If that ever stops, the container
     # stays up so ./ts keeps working.
     command: ["sh", "-c", "ts record; exec sleep infinity"]

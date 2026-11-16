@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 
-from . import __version__, cases, config, history, learn, llm, watch
+from . import __version__, cases, config, history, hosts, learn, llm, watch
 from .engine import Session
 from .redact import strip_control
 from .run import run
@@ -201,14 +201,8 @@ def report(settings, session, ui):
     print()
     if not text:
         return
-    now = datetime.datetime.now()
-    name = f"{now:%Y%m%d-%H%M%S}.md"
     try:
-        os.makedirs(os.path.join(settings.log_dir, "reports"), exist_ok=True)
-        with open(os.path.join(settings.log_dir, "reports", name), "w", encoding="utf-8") as f:
-            f.write(f"Incident report\nHost: {socket.gethostname()}\nMade: {now:%Y-%m-%d %H:%M}, by the model "
-                    f"{settings.llm_model} from a troubleshooter chat. Check it before passing it on.\n\n{text}\n")
-        print(f"Saved in the log folder: reports/{name}")
+        print(f"Saved in the log folder: reports/{cases.save_report(settings, text)}")
     except OSError as e:
         print(paint("33", f"! Could not save the report: {e}"))
 
@@ -234,6 +228,34 @@ def case(settings, session, ui, log):
         print(f"Saved: {cases.title(text)}\nOther hosts see it once you leave this chat.")
     except OSError as e:
         print(paint("33", f"! Could not save the case: {e}"))
+
+
+def background(settings):
+    """What the container does by itself: record what is deployed, and on a hub or an agent, serve."""
+    kind = config.role(settings)
+    log = make_log(settings)
+    # An agent leaves Kubernetes to the hub, which looks at the clusters once for every host.
+    box = Toolbox(dataclasses.replace(settings, kubernetes=False) if kind == "agent" else settings)
+    jobs = [("The recorder", lambda: history.record_forever(box, settings.record_minutes))]
+    if kind == "agent":
+        jobs.append(("The agent", lambda: hosts.serve_agent(settings, log)))
+    if kind == "hub":
+        from . import web  # only the hub needs it
+        jobs.append(("The web page", lambda: web.serve(settings, log)))
+
+    def keep(name, job):
+        while True:
+            try:
+                job()
+                return  # it chose to stop (turned off, or not set up yet)
+            except Exception as e:
+                print(f"{name} stopped ({e}). Starting it again in 30 seconds.", flush=True)
+                time.sleep(30)
+    print(f"This host runs as: {kind}.", flush=True)
+    for name, job in jobs:
+        threading.Thread(target=keep, args=(name, job), daemon=True).start()
+    threading.Event().wait()  # the container stays up for ./ts whatever the jobs do
+    return 0
 
 
 def keep_history(box):
@@ -296,6 +318,52 @@ def check_cluster(box, c, report):
         print(f"       may {label}: {said}" + ("  <- too much: use scripts/make-kubeconfig.sh" if warn else ""))
 
 
+def check_hosts(settings, box, report):
+    """The hub and its agents: is each one set up, and does it answer?"""
+    kind = config.role(settings)
+    if kind == "alone":
+        return
+    why = hosts.not_ready(settings)
+    if why:
+        report("Talking to other hosts", False, why)
+        return
+    left = hosts.days_left(settings.tls_cert)
+    if left is not None and left < 30:
+        report("Certificate between hosts", left >= 0, f"{'runs out in ' + str(left) + ' days' if left >= 0 else 'has run out'}. "
+               f"Delete certs/troubleshooter-cert.pem, run ./ts setup, then docker compose up -d on every host.")
+    if kind == "agent":
+        try:
+            socket.create_connection(("127.0.0.1", settings.agent_port), timeout=3).close()
+            report("Agent", True, f"answers the hub {config.short(settings.hub_host)} on port {settings.agent_port}")
+        except OSError as e:
+            report("Agent", False, f"nothing listens on port {settings.agent_port} ({e}). Run docker compose up -d.")
+        return
+    if not box.agents:
+        print("[skip] Agents: agent-hosts is empty, so this hub looks at itself only")
+    for host in box.agents:
+        try:
+            started = time.monotonic()
+            hosts.ask(settings, host, "_problems", timeout=20)
+            report(f"Agent {host}", True, f"answered in {time.monotonic() - started:.1f} s")
+        except hosts.Unreachable as e:
+            report(f"Agent {host}", False, str(e))
+    count = sum(":" in u for u in settings.web_users.split(","))
+    try:
+        socket.create_connection(("127.0.0.1", settings.web_port), timeout=3).close()
+        report("Web page", count > 0, f"https://{socket.gethostname()}:{settings.web_port}, {count} account(s)"
+               + ("" if count else ". Add one with: ./ts user add NAME"))
+        if hosts.own_web_cert(settings):
+            left = hosts.days_left(settings.web_cert)
+            report("Web page certificate", left is None or left >= 0,
+                   "your own" + ("" if left is None else f", runs out in {left} days" if left >= 0 else
+                                 ", HAS RUN OUT: give a new one with ./ts setup --web-cert CERT KEY"))
+        else:
+            print("[ok] Web page certificate: the one ./ts setup made, so browsers warn. "
+                  "To use your own: ./ts setup --web-cert CERT KEY")
+    except OSError as e:
+        report("Web page", False, f"nothing listens on port {settings.web_port} ({e}). Run docker compose up -d.")
+
+
 def check(settings):
     """Test each connection the tool depends on, and say plainly what's wrong."""
     failed = 0
@@ -308,7 +376,9 @@ def check(settings):
     r = run(["docker", "version", "--format", "{{.Server.Version}}"])
     report("Docker", r.ok, r.text[:120])
     box = Toolbox(settings)
-    if not box.clusters:
+    if not settings.kubernetes:
+        print("[skip] Kubernetes: turned off (kubernetes: off in compose.yaml)")
+    elif not box.clusters:
         print("[skip] Kubernetes: no kubectl login on this host, and nothing in ./kube")
     for c in box.clusters.values():
         check_cluster(box, c, report)
@@ -319,6 +389,7 @@ def check(settings):
     else:
         print("[skip] Runbooks: no ./runbooks folder mounted")
     print(f"[ok] Cases: {len(cases.all_cases(settings))} saved")
+    check_hosts(settings, box, report)
     try:
         ids = llm.models(settings)
         window = llm.context_tokens(settings)
@@ -374,8 +445,7 @@ def main():
             print(json.dumps(cases.waiting(settings)))
         return 0
     if command == "record":  # the container's own start command
-        history.record_forever(Toolbox(settings), settings.record_minutes)
-        return 0
+        return background(settings)
     if command == "watch":
         return watch.main(settings, Toolbox(settings), sys.argv[2:], make_log(settings))
     if command == "tools":
@@ -387,7 +457,7 @@ def main():
         except ImportError:
             pass
         return chat(settings)
-    print("Usage: ./ts [chat|check|watch|tools|learn /apps/myapp|--help]")
+    print("Usage: ./ts [chat|check|watch|tools|learn /apps/myapp|setup|user add NAME|--help]")
     return 2
 
 

@@ -37,14 +37,51 @@ What comes next, in build order. Done items are ticked.
 
 ## Phase 4: reach
 
-- [ ] 13. Web page. Best after item 8: a change timeline reads well on
-      a page.
+- [x] 13. Web page: see "Web page: built" below.
 - [ ] 14. vCenter read-only tools: ESXi hosts, datastores, alarms,
       tasks. Needs a read-only vCenter account.
 - [ ] 15. NSX read-only tools, only if the network kinds on the
       Supervisor leave gaps. Needs NSX API access.
 - [x] 16. `learn-llm-url` and `learn-llm-model`: one model for chat and
       another for `./ts learn`.
+
+## Web page: built
+
+One web page for everything, same code on every host.
+
+    browser -> HUB host: the page, the Kubernetes watch, one
+               Kubernetes history, the cluster logins, its own
+               Docker and host
+            -> AGENT hosts: answer for their own Docker, host,
+               app folders and logs; record their own Docker
+
+- [x] `kubernetes` on/off, for Docker-only sites.
+- [x] Agent on tcp/8001: encrypted, shared key, answers only the
+      hub, fixed read tools only.
+- [x] `hub-host` and `agent-hosts`; a host choice on the Docker and
+      host tools; `./ts` and `./ts watch` on the hub cover every host.
+- [x] `./ts setup` (keys and certificate) and `./ts user` (accounts).
+- [x] The page, with sign-in, on tcp/9001. It looks only.
+- [x] `./ts setup --web-cert`: your own certificate for the page.
+- [x] A. Chat, with each step's full output beside it.
+- [x] C. Health: open problems first, then everything watched.
+- [x] B. What changed, as a timeline.
+- [x] D. Library: cases, runbooks and reports; cases can be edited
+      and deleted.
+
+Tested on one dev host only, with a second process standing in for
+another host. Still to prove on production:
+
+- [ ] Real traffic between separate hosts, and the hub-address check
+      on hosts with several addresses.
+- [ ] The two service-account kubeconfigs in `kube/` on the hub.
+- [ ] Root-squashed NFS: the certificate must be readable by the
+      container; the keys are in `.env`, not in the shared folder.
+
+Ideas for later:
+
+- Fixes from the page, with approval and a record of who approved.
+- The timeline's recording bar per cluster, not one for everything.
 
 ## Also done
 

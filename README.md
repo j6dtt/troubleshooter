@@ -56,6 +56,32 @@ Log: `logs/<date>.log`, including every approval and refusal.
   shared by every host that runs from the same folder; edit or delete the
   files to correct them.
 
+## Several hosts and the web page
+
+Every host runs the same code from one shared folder. One setting, `hub-host`,
+names the hub; the hosts in `agent-hosts` are agents.
+
+    browser ── https ── HUB: the page, the Kubernetes watch and
+                        history, its own Docker and host
+                         │  encrypted, shared key, hub only
+                        AGENTS: their own Docker, host and app files
+
+- **Agents** listen on `agent-port` (8001) and run only the fixed read tools,
+  only for the hub: no fixes, no Kubernetes, no shell.
+- **`./ts setup`** makes the shared key and the certificate once; they go to
+  `.env` and `certs/` and are never shown.
+- **The page** is at `https://<hub>:<web-port>` (9001). It looks only; fixes
+  stay in `./ts`. Accounts: `./ts user add NAME`, kept in `.env` as hashes.
+- **Your own certificate for the page:** `./ts setup --web-cert CERT KEY`, so
+  browsers don't warn. Hosts keep talking to each other with the one
+  `./ts setup` made.
+- **`./ts` on the hub** can look at the other hosts ("why is relay unhealthy
+  on host-02?"). On an agent host it sees only that host.
+- **Docker only:** `kubernetes: "off"` removes every cluster tool and mention.
+
+The page's files live in `webpage.py`, so an update is `.py` files only, and
+nothing is loaded from the internet.
+
 ## Kubernetes and VKS
 
 Log in as usual, then run `./ts`. It starts on your current kubectl context

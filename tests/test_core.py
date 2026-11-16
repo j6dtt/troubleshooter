@@ -10,7 +10,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from unittest import mock
 
-from troubleshooter import cases, cli, config, engine, history, launcher, learn, llm, tools, watch
+from troubleshooter import cases, cli, config, engine, history, hosts, launcher, learn, llm, tools, watch, web, webpage
 from troubleshooter.config import Settings
 from troubleshooter.redact import clean, mask, strip_control
 from troubleshooter.run import run
@@ -882,14 +882,16 @@ class History(unittest.TestCase):
 
 
 class Watch(unittest.TestCase):
-    def run_watch(self, rounds_of_overview, argv=()):
-        box = mock.Mock(clusters={}, roles={})
+    def run_watch(self, docker_rounds, argv=(), kube=None, agents=None):
+        box = mock.Mock(clusters={"vks": None} if kube else {}, roles={"vks": "workload"}, agents=agents or {}, here="host-01", s=Settings())
         box._disks.return_value = [(95, "/data: 95% used, 1.0 GB free of 20.0 GB"), (40, "/: 40% used")]
         box._meminfo.return_value = {"MemAvailable": 8000, "MemTotal": 16000}
-        box.overview.side_effect = rounds_of_overview
+        box._docker_summary.side_effect = docker_rounds
+        box._swarm_summary.return_value = "SWARM: not active"
+        box._k8s_summary.return_value = kube
         out, logged = io.StringIO(), []
         with redirect_stdout(out), mock.patch.object(history, "record", lambda b: None):
-            code = watch.main(Settings(), box, list(argv), logged.append, sleep=lambda s: None, rounds=len(rounds_of_overview))
+            code = watch.main(Settings(), box, list(argv), logged.append, sleep=lambda s: None, rounds=len(docker_rounds))
         return code, out.getvalue(), logged
 
     def test_speaks_only_on_change(self):
@@ -905,7 +907,8 @@ class Watch(unittest.TestCase):
         self.assertIn("Watch found a new problem: docker: relay: Exited (1) 2 minutes ago", logged)
 
     def test_unreachable_cluster_is_a_problem(self):
-        _, out, _ = self.run_watch(["KUBERNETES vks: not reachable: the login was refused: the token has expired or is wrong."])
+        _, out, _ = self.run_watch(["DOCKER: 1 of 1 containers running; 0 need a look"],
+                                   kube="KUBERNETES vks: not reachable: the login was refused: the token has expired or is wrong.")
         self.assertIn("PROBLEM   kubernetes vks: not reachable: the login was refused", out)
 
     def test_a_failed_round_does_not_end_the_watch(self):
@@ -914,6 +917,20 @@ class Watch(unittest.TestCase):
 
     def test_bad_arguments(self):
         self.assertEqual(self.run_watch([], argv=["--often"])[0], 2)
+
+    def test_hub_names_the_host_of_each_problem(self):
+        def ask(settings, host, tool, args=None, timeout=90):
+            if host == "host-03":
+                raise hosts.Unreachable("connection refused")
+            return json.dumps({"problems": {"docker|relay exited": "docker: relay: Exited (1) 2 minutes ago"},
+                               "lines": [{"kind": "Docker", "where": "", "line": "1 of 2 containers running", "problems": 1}]})
+        with mock.patch.object(hosts, "ask", ask):
+            _, out, _ = self.run_watch(["DOCKER: 1 of 1 containers running; 0 need a look"],
+                                       agents={"host-02": "host-02", "host-03": "host-03"})
+        self.assertIn("PROBLEM   host-01 host: disk /data", out)
+        self.assertIn("PROBLEM   host-02 docker: relay: Exited (1) 2 minutes ago", out)
+        self.assertIn("PROBLEM   host-03 its agent did not answer: connection refused", out)
+        self.assertIn("and 2 other host(s)", out)
 
 
 class Report(unittest.TestCase):
@@ -967,12 +984,16 @@ class Cases(unittest.TestCase):
 
     def share(self):
         """What ./ts does on the host after a chat."""
-        for key, text in cases.waiting(self.s).items():
+        todo = cases.waiting(self.s)
+        for key in todo["delete"]:
+            host, name = key.split("/")
+            os.unlink(os.path.join(self.s.runbook_dir, "_cases", host, name))
+        for key, text in todo["save"].items():
             host, name = key.split("/")
             os.makedirs(os.path.join(self.s.runbook_dir, "_cases", host), exist_ok=True)
             with open(os.path.join(self.s.runbook_dir, "_cases", host, name), "w") as f:
                 f.write(text)
-        cases.sent(self.s, list(cases.waiting(self.s)) or [f"{h}/{n}" for h, n, _ in cases.all_cases(self.s)])
+        cases.sent(self.s, list(todo["save"]) + todo["delete"])
 
     def test_saved_case_is_found_by_its_words_and_masked(self):
         name = cases.save(self.s, NOTE, "work")
@@ -1000,9 +1021,9 @@ class Cases(unittest.TestCase):
     def test_copied_to_the_shared_folder_once_and_then_read_from_there(self):
         name = cases.save(self.s, NOTE, "")
         host = os.listdir(os.path.join(self.s.log_dir, "cases"))[0]
-        self.assertEqual(list(cases.waiting(self.s)), [f"{host}/{name}"])
+        self.assertEqual(list(cases.waiting(self.s)["save"]), [f"{host}/{name}"])
         self.share()
-        self.assertEqual(cases.waiting(self.s), {})
+        self.assertEqual(cases.waiting(self.s), {"save": {}, "delete": []})
         self.assertEqual(os.listdir(os.path.join(self.s.log_dir, "cases", host)), [])
         self.assertEqual(len(cases.all_cases(self.s)), 1)
         os.unlink(os.path.join(self.s.runbook_dir, "_cases", host, name))  # the operator deletes a case
@@ -1013,6 +1034,39 @@ class Cases(unittest.TestCase):
         host = os.listdir(os.path.join(self.s.log_dir, "cases"))[0]
         cases.sent(self.s, [f"{host}/{name}", "../../etc/passwd", "x"])
         self.assertEqual(len(cases.all_cases(self.s)), 1)
+
+    def test_edit_and_delete_from_the_page_reach_the_shared_folder(self):
+        name = cases.save(self.s, NOTE, "")
+        host = os.listdir(os.path.join(self.s.log_dir, "cases"))[0]
+        key = f"{host}/{name}"
+        self.share()
+        shared = os.path.join(self.s.runbook_dir, "_cases", host, name)
+        cases.rewrite(self.s, key, "TITLE: corrected\nCAUSE\nthe real one, token=abcdefgh12345678")
+        self.assertIn("corrected", cases.find(self.s, key))        # at once on this host
+        self.assertNotIn("abcdefgh12345678", cases.find(self.s, key))
+        with open(shared) as f:
+            self.assertIn("PAYMENT_URL", f.read())                  # the shared copy waits for ./ts
+        self.share()
+        with open(shared) as f:
+            self.assertIn("corrected", f.read())
+        self.assertEqual(cases.waiting(self.s), {"save": {}, "delete": []})
+        cases.remove(self.s, key)
+        self.assertEqual(cases.all_cases(self.s), [])
+        self.assertTrue(os.path.exists(shared))
+        self.share()
+        self.assertFalse(os.path.exists(shared))
+        self.assertEqual(cases.waiting(self.s), {"save": {}, "delete": []})
+        for bad in ("../x/y.md", "host/../../etc.md", "nohost"):
+            with self.assertRaises(ValueError):
+                cases.remove(self.s, bad)
+
+    def test_a_case_not_yet_shared_is_edited_and_deleted_in_place(self):
+        name = cases.save(self.s, NOTE, "")
+        key = f"{os.listdir(os.path.join(self.s.log_dir, 'cases'))[0]}/{name}"
+        cases.rewrite(self.s, key, "TITLE: corrected")
+        self.assertEqual(cases.find(self.s, key).strip(), "TITLE: corrected")
+        cases.remove(self.s, key)
+        self.assertEqual(cases.waiting(self.s), {"save": {}, "delete": []})
 
     def test_cases_are_not_runbooks_and_other_files_are_ignored(self):
         cases.save(self.s, NOTE, "")
@@ -1057,8 +1111,12 @@ class Cases(unittest.TestCase):
 
     def test_launcher_writes_cases_to_the_shared_folder(self):
         home, calls = tempfile.mkdtemp(), []
-        found = {"host-a/20261115-000000-web.md": "# web\ntext", "../x/evil.md": "bad", "host-a/.hid.md": "bad",
-                 "host-a/a b.md": "bad", "host-a/notes.txt": "bad"}
+        found = {"save": {"host-a/20261115-000000-web.md": "# web\ntext", "../x/evil.md": "bad", "host-a/.hid.md": "bad",
+                          "host-a/a b.md": "bad", "host-a/notes.txt": "bad"},
+                 "delete": ["host-a/20260101-000000-old.md", "../../etc/passwd"]}
+        os.makedirs(os.path.join(home, "runbooks", "_cases", "host-a"))
+        with open(os.path.join(home, "runbooks", "_cases", "host-a", "20260101-000000-old.md"), "w") as f:
+            f.write("old")
 
         def quiet(argv):
             calls.append(argv)
@@ -1072,8 +1130,8 @@ class Cases(unittest.TestCase):
             os.chdir(here)
         self.assertEqual(os.listdir(os.path.join(home, "runbooks", "_cases")), ["host-a"])
         self.assertEqual(os.listdir(os.path.join(home, "runbooks", "_cases", "host-a")), ["20261115-000000-web.md"])
-        self.assertEqual(calls[-1][-2:], ["--sent", "host-a/20261115-000000-web.md"])
-        self.assertIn("Saved 1 case(s) for every host", out.getvalue())
+        self.assertEqual(calls[-1][-3:], ["--sent", "host-a/20260101-000000-old.md", "host-a/20261115-000000-web.md"])
+        self.assertIn("Updated 2 case(s) for every host", out.getvalue())
         self.assertEqual(os.stat(os.path.join(home, "runbooks", "_cases", "host-a", "20261115-000000-web.md")).st_mode & 0o777, 0o644)
 
 
@@ -1145,6 +1203,372 @@ class Recorder(unittest.TestCase):
         self.assertEqual(len(os.listdir(history.folder(s))), 1)
         got, _ = history.before(s, 2000)
         self.assertIn("a", got["k8s"])
+
+
+def on(host, **more):
+    """Settings as seen on the host named `host`."""
+    return mock.patch.object(config.socket, "gethostname", lambda: host), Settings(**more)
+
+
+class Roles(unittest.TestCase):
+    def test_one_setting_decides_what_each_host_is(self):
+        for host, want in (("host-01", "hub"), ("HOST-01.example.com", "hub"), ("host-02", "agent")):
+            patch, s = on(host, hub_host="host-01", agent_hosts=("host-01", "host-02", "host-03=10.0.0.13"))
+            with patch:
+                self.assertEqual(config.role(s), want)
+                self.assertEqual(config.agents(s), {"host-02": "host-02", "host-03": "10.0.0.13"} if want == "hub" else {})
+        patch, s = on("host-01")
+        with patch:
+            self.assertEqual(config.role(s), "alone")
+
+    def test_only_the_hub_gets_a_host_choice_and_never_on_fix_or_cluster_tools(self):
+        patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02",))
+        with patch:
+            box = tools.Toolbox(s, clusters=ONE)
+        self.assertEqual(box.tools["docker_logs"].params["host"].enum, ("host-01", "host-02"))
+        for name in ("docker_restart", "k8s_get", "vks_cluster_health", "past_cases", "k8s_contexts"):
+            self.assertNotIn("host", box.tools[name].params)
+        self.assertEqual(box.tools["read_runbook"].params["host"].enum, ())  # its own argument: whose runbook
+        patch, s = on("host-02", hub_host="host-01", agent_hosts=("host-02",))
+        with patch:
+            self.assertNotIn("host", tools.Toolbox(s, clusters={}).tools["docker_logs"].params)
+
+    def test_a_tool_goes_to_the_other_host_only_when_asked(self):
+        patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02",))
+        asked = []
+
+        def ask(settings, host, tool, args=None, timeout=90):
+            asked.append((host, tool, args))
+            if host == "host-02":
+                return "from host-02"
+            raise hosts.Unreachable("no answer")
+        with patch, mock.patch.object(hosts, "ask", ask), mock.patch.object(tools, "run", lambda *a, **k: reply(True, "from here")):
+            box = tools.Toolbox(s, clusters={})
+            t = box.tools["docker_logs"]
+            self.assertEqual(t.fn(**t.check({"container": "web", "host": "host-02", "tail": 5})), "from host-02")
+            self.assertEqual(asked, [("host-02", "docker_logs", {"container": "web", "tail": 5})])
+            self.assertEqual(t.fn(**t.check({"container": "web"})), "from here")
+            self.assertEqual(t.fn(**t.check({"container": "web", "host": "host-01"})), "from here")
+            self.assertEqual(len(asked), 1)
+            self.assertEqual(t.describe({"container": "web", "host": "host-02"}), "Read logs of container web on host-02")
+            with self.assertRaises(tools.BadInput):
+                t.check({"container": "web", "host": "host-99"})
+
+    def test_model_is_told_about_the_other_hosts(self):
+        patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02",), llm_url="http://x", llm_model="m", kube_dir="/none")
+        with patch:
+            sess = engine.Session(s, UI())
+        self.assertIn("You are on the hub host host-01", sess.messages[0]["content"])
+        self.assertIn("You can only change things on host-01", sess.messages[0]["content"])
+
+
+class AgentAnswers(unittest.TestCase):
+    def setUp(self):
+        patch, s = on("host-02", hub_host="host-01=10.0.0.11", agent_key="k", log_dir=tempfile.mkdtemp())
+        with patch:
+            self.logged = []
+            self.agent = hosts.Agent(s, self.logged.append)
+
+    def test_looks_only_and_only_at_its_own_machine(self):
+        for tool in ("docker_restart", "docker_stop", "k8s_get", "k8s_delete_pod", "vks_cluster_health", "past_cases", "read_runbook", "nonsense"):
+            ok, text = self.agent.run(tool, {})
+            self.assertFalse(ok)
+            self.assertIn("not a tool this agent answers", text)
+
+    def test_arguments_are_checked_as_in_a_chat(self):
+        ok, text = self.agent.run("docker_inspect", {"container": "a;rm -rf /"})
+        self.assertFalse(ok)
+        self.assertIn("Refused", text)
+        ok, text = self.agent.run("read_file", {"path": "/etc/shadow"})
+        self.assertIn("Refused", text)
+        self.assertTrue(any("Refused a read_file request from the hub" in line for line in self.logged))
+
+    def test_runs_a_read_tool_and_logs_it(self):
+        with mock.patch.object(tools, "run", lambda *a, **k: reply(True, "NAMES\nweb")):
+            ok, text = self.agent.run("docker_list", {"include_stopped": False})
+        self.assertTrue(ok)
+        self.assertIn("web", text)
+        self.assertIn("The hub asked: Listed containers", self.logged[-1])
+
+    def test_only_the_hubs_address_may_call(self):
+        self.assertTrue(self.agent.may_call("10.0.0.11"))
+        self.assertTrue(self.agent.may_call("::ffff:10.0.0.11"))
+        self.assertFalse(self.agent.may_call("10.0.0.99"))
+
+    def test_not_ready_says_what_to_do(self):
+        self.assertIn("./ts setup", hosts.not_ready(Settings()))
+        self.assertIn("TLS_KEY", hosts.not_ready(Settings(agent_key="k")))
+        self.assertIn("certificate", hosts.not_ready(Settings(agent_key="k", tls_key="x", tls_cert="/nowhere.pem")))
+
+    def test_asking_an_unknown_host_is_refused_before_any_connection(self):
+        patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02",))
+        with patch, self.assertRaises(hosts.Unreachable) as e:
+            hosts.ask(s, "host-99", "docker_list")
+        self.assertIn("not one of the agent hosts", str(e.exception))
+
+
+class DockerOnly(unittest.TestCase):
+    def test_off_means_no_cluster_tools_and_no_word_of_clusters(self):
+        with mock.patch.dict(os.environ, {"KUBE_PROXIES": "vks|7001|;", "KUBE_CURRENT": "vks"}):
+            self.assertIn("k8s_get", tools.Toolbox(Settings(kube_dir="/none")).tools)
+            s = Settings(kubernetes=False, kube_dir="/none", llm_url="http://x", llm_model="m")
+            box = tools.Toolbox(s)
+            sess = engine.Session(s, UI())
+        self.assertEqual([n for n in box.tools if n.startswith(("k8s_", "vks_", "pod_"))], [])
+        self.assertNotIn("Kubernetes", sess.messages[0]["content"])
+        self.assertIn("docker_list", box.tools)
+
+    def test_launcher_reads_the_setting_and_starts_no_proxies(self):
+        home = tempfile.mkdtemp()
+        for text, want in (('  kubernetes: &kubernetes "off"\n', True), ('  kubernetes: &kubernetes "on"\n', False),
+                           ('  # kubernetes: &kubernetes "off"\n  kubernetes: &kubernetes "on"\n', False), ("", False)):
+            with open(os.path.join(home, "compose.yaml"), "w") as f:
+                f.write("x-settings:\n" + text)
+            with mock.patch.object(launcher, "HOME", home):
+                self.assertEqual(launcher.kubernetes_off(), want)
+
+
+class Setup(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        with open(os.path.join(self.home, ".env"), "w") as f:
+            f.write("# Secrets only.\nLLM_API_KEY=keep-me\n")
+        patches = [mock.patch.object(launcher, "ENV", os.path.join(self.home, ".env")),
+                   mock.patch.object(launcher, "CERT", os.path.join(self.home, "certs", "troubleshooter-cert.pem"))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def run_it(self, fn, *args, passwords=()):
+        given, out = list(passwords), io.StringIO()
+        with mock.patch.object(launcher.getpass, "getpass", lambda prompt: given.pop(0)), redirect_stdout(out):
+            code = fn(*args)
+        return code, out.getvalue()
+
+    def env(self):
+        return launcher.env_read()[1]
+
+    def test_setup_writes_keys_once_and_never_shows_them(self):
+        code, out = self.run_it(launcher.setup, ["setup"])
+        self.assertEqual(code, 0)
+        env = self.env()
+        self.assertEqual(env["LLM_API_KEY"], "keep-me")
+        self.assertGreater(len(env["AGENT_KEY"]), 30)
+        self.assertIn("PRIVATE KEY", __import__("base64").b64decode(env["TLS_KEY"]).decode())
+        self.assertTrue(os.path.isfile(launcher.CERT))
+        self.assertEqual(os.stat(launcher.ENV).st_mode & 0o777, 0o600)
+        self.assertNotIn(env["AGENT_KEY"], out)
+        self.assertNotIn(env["TLS_KEY"][:40], out)
+        self.assertEqual(os.listdir(os.path.dirname(launcher.CERT)), ["troubleshooter-cert.pem"])
+        code, out = self.run_it(launcher.setup, ["setup"])
+        self.assertIn("Nothing to do", out)
+        self.assertEqual(self.env()["AGENT_KEY"], env["AGENT_KEY"])
+
+    def test_made_certificate_works_between_a_hub_and_an_agent(self):
+        self.run_it(launcher.setup, ["setup"])
+        env = self.env()
+        s = Settings(agent_key=env["AGENT_KEY"], tls_key=env["TLS_KEY"], tls_cert=launcher.CERT)
+        with mock.patch.object(hosts, "KEY_FILE", os.path.join(self.home, "key.pem")):
+            self.assertEqual(hosts.not_ready(s), "")
+            hosts.server_context(s)
+            hosts.client_context(s)
+            self.assertEqual(os.stat(os.path.join(self.home, "key.pem")).st_mode & 0o777, 0o600)
+
+    def make(self, name, subject):
+        key, cert = os.path.join(self.home, name + ".key"), os.path.join(self.home, name + ".pem")
+        __import__("subprocess").run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "5", "-subj", subject,
+                                      "-keyout", key, "-out", cert], check=True, capture_output=True)
+        return cert, key
+
+    def test_own_certificate_for_the_page_only(self):
+        web_cert = os.path.join(self.home, "certs", "web-cert.pem")
+        self.run_it(launcher.setup, ["setup"])
+        cert, key = self.make("mine", "/CN=hub.example")
+        other_cert, other_key = self.make("other", "/CN=other")
+        with mock.patch.object(launcher, "WEB_CERT", web_cert), mock.patch.object(launcher, "START", self.home):
+            for args, word in (([cert, other_key], "do not belong together"), ([key, key], "not a certificate"),
+                               (["missing.pem", key], "Could not read"), ([cert], "Usage")):
+                code, out = self.run_it(launcher.setup, ["setup", "--web-cert"] + args)
+                self.assertNotEqual(code, 0)
+                self.assertIn(word, out)
+            self.assertNotIn("WEB_TLS_KEY", self.env())
+            code, out = self.run_it(launcher.setup, ["setup", "--web-cert", "mine.pem", "mine.key"])  # names as typed
+            self.assertEqual(code, 0)
+            env = self.env()
+            self.assertNotIn(env["WEB_TLS_KEY"][:40], out)
+            s = Settings(agent_key=env["AGENT_KEY"], tls_key=env["TLS_KEY"], tls_cert=launcher.CERT,
+                         web_tls_key=env["WEB_TLS_KEY"], web_cert=web_cert)
+            self.assertTrue(hosts.own_web_cert(s))
+            self.assertIn(hosts.days_left(web_cert), (4, 5))
+            with mock.patch.object(hosts, "KEY_FILE", os.path.join(self.home, "k1")), \
+                    mock.patch.object(hosts, "WEB_KEY_FILE", os.path.join(self.home, "k2")):
+                hosts.server_context(s, web=True)
+                self.assertTrue(os.path.exists(os.path.join(self.home, "k2")))
+                self.assertFalse(os.path.exists(os.path.join(self.home, "k1")))   # the page did not touch the hosts' key
+                hosts.server_context(s)                                            # agents: still the one setup made
+                self.assertTrue(os.path.exists(os.path.join(self.home, "k1")))
+            code, out = self.run_it(launcher.setup, ["setup", "--web-cert", "remove"])
+            self.assertEqual(code, 0)
+            self.assertFalse(os.path.exists(web_cert))
+            self.assertFalse(hosts.own_web_cert(Settings(web_tls_key=self.env()["WEB_TLS_KEY"], web_cert=web_cert)))
+
+    def test_a_key_with_a_passphrase_is_refused_with_the_way_out(self):
+        cert, key = self.make("mine", "/CN=hub.example")
+        locked = os.path.join(self.home, "locked.key")
+        __import__("subprocess").run(["openssl", "pkey", "-in", key, "-aes256", "-passout", "pass:secret123", "-out", locked],
+                                      check=True, capture_output=True)
+        with mock.patch.object(launcher, "START", self.home):
+            code, out = self.run_it(launcher.setup, ["setup", "--web-cert", cert, locked])
+        self.assertEqual(code, 1)
+        self.assertIn("openssl pkey -in", out)
+
+    def test_accounts_are_kept_as_hashes(self):
+        code, out = self.run_it(launcher.user, ["user", "add", "alice"], passwords=["correct horse 1", "correct horse 1"])
+        self.assertEqual(code, 0)
+        stored = web.users(Settings(web_users=self.env()["WEB_USERS"]))
+        self.assertNotIn("correct horse", self.env()["WEB_USERS"])
+        self.assertTrue(web.password_ok(stored["alice"], "correct horse 1"))
+        self.assertFalse(web.password_ok(stored["alice"], "correct horse 2"))
+        self.assertFalse(web.password_ok("nonsense", "x"))
+        self.run_it(launcher.user, ["user", "add", "bob"], passwords=["another long one", "another long one"])
+        self.assertEqual(sorted(web.users(Settings(web_users=self.env()["WEB_USERS"]))), ["alice", "bob"])
+        self.assertIn("alice\nbob", self.run_it(launcher.user, ["user", "list"])[1])
+        self.run_it(launcher.user, ["user", "remove", "alice"])
+        self.assertEqual(list(web.users(Settings(web_users=self.env()["WEB_USERS"]))), ["bob"])
+
+    def test_bad_passwords_and_names_change_nothing(self):
+        for args, passwords in ((["user", "add", "al"], ["short", "short"]), (["user", "add", "al"], ["long enough 1", "different 22"]),
+                                (["user", "add", "a b"], []), (["user", "add", "a,b:c"], []), (["user", "remove", "ghost"], [])):
+            code, _ = self.run_it(launcher.user, args, passwords=passwords)
+            self.assertNotEqual(code, 0)
+        self.assertNotIn("WEB_USERS", self.env())
+
+
+class Page(unittest.TestCase):
+    def setUp(self):
+        base = tempfile.mkdtemp()
+        salt = "00" * 16
+        import hashlib
+        stored = "pbkdf2$1000$" + salt + "$" + hashlib.pbkdf2_hmac("sha256", b"right password", bytes.fromhex(salt), 1000).hex()
+        self.s = Settings(llm_url="", llm_model="m", kube_dir="/none", log_dir=os.path.join(base, "logs"),
+                          runbook_dir=os.path.join(base, "runbooks"), web_users="alice:" + stored + ",bob:" + stored)
+        os.makedirs(self.s.log_dir)
+        os.makedirs(os.path.join(self.s.runbook_dir, "host-01"))
+        self.logged = []
+        self.site = web.Site(self.s, self.logged.append)
+
+    def test_sign_in_and_lockout(self):
+        token, why = self.site.sign_in("alice", "right password", "10.0.0.5")
+        self.assertEqual(self.site.who(token), "alice")
+        self.assertIsNone(self.site.who("made-up"))
+        self.site.sign_out(token)
+        self.assertIsNone(self.site.who(token))
+        for _ in range(5):
+            self.assertEqual(self.site.sign_in("alice", "wrong", "10.0.0.6"), (None, "Wrong name or password."))
+        self.assertIn("Too many wrong tries", self.site.sign_in("alice", "right password", "10.0.0.6")[1])
+        self.assertIsNotNone(self.site.sign_in("alice", "right password", "10.0.0.7")[0])  # another address is not locked
+        self.assertEqual(self.site.sign_in("ghost", "right password", "10.0.0.8"), (None, "Wrong name or password."))
+        self.assertTrue(any("signed in to the page" in line for line in self.logged))
+
+    def test_page_looks_only(self):
+        chat = self.site.chat("alice")
+        names = list(chat.session.box.tools)
+        self.assertIn("docker_logs", names)
+        self.assertEqual([n for n in names if n in ("docker_restart", "docker_stop", "k8s_restart", "k8s_scale", "swarm_scale")], [])
+        self.assertFalse(chat.approve("x", "y", "z"))
+
+    def test_a_chat_belongs_to_the_person_who_started_it(self):
+        chat = self.site.chat("alice")
+        self.assertIs(self.site.chat("alice", chat.id), chat)
+        self.assertIsNone(self.site.chat("bob", chat.id))
+        self.assertIsNone(self.site.chat("alice", "no-such-chat"))
+
+    def test_a_question_becomes_events_with_each_steps_output_kept(self):
+        chat = self.site.chat("alice")
+        replies = [call("docker_list"), {"role": "assistant", "content": "web is **down**."}]
+
+        def fake(settings, messages, tools=None, on_text=None, **kw):
+            r = replies.pop(0)
+            if r["content"] and on_text:
+                on_text(r["content"])
+            return r, "stop"
+        with mock.patch.object(llm, "chat", fake), mock.patch.object(tools, "run", lambda *a, **k: reply(True, "NAMES\nweb Exited")):
+            self.assertTrue(chat.run(lambda: chat.ask("why is web down?", "")))
+            for _ in range(200):
+                rows, busy = chat.since(0)
+                if not busy:
+                    break
+        kinds = [e["t"] for e in rows]
+        self.assertEqual(kinds, ["ask", "step", "result", "text", "done"])
+        self.assertEqual(rows[1]["d"], "Listed containers")
+        self.assertIn("web Exited", chat.outputs[1])
+        self.assertEqual(chat.since(3)[0][0]["d"], "web is **down**.")
+        self.assertTrue(any("[page, alice] You asked: why is web down?" in line for line in self.logged))
+
+    def test_only_one_answer_at_a_time_and_stop_ends_it(self):
+        chat = self.site.chat("alice")
+        gate = __import__("threading").Event()
+        self.assertTrue(chat.run(gate.wait))
+        self.assertFalse(chat.run(lambda: None))
+        gate.set()
+        for _ in range(200):
+            if not chat.since(0)[1]:
+                break
+        chat.stopped = True
+        with self.assertRaises(KeyboardInterrupt):
+            chat.text("more")
+        with self.assertRaises(KeyboardInterrupt):
+            chat.step("a step")
+
+    def test_library_reads_only_inside_its_folders(self):
+        with open(os.path.join(self.s.runbook_dir, "host-01", "web.md"), "w") as f:
+            f.write("# Runbook: web\nStatus: REVIEWED\n")
+        name = cases.save(self.s, NOTE, "")
+        report = cases.save_report(self.s, "SUMMARY\nall fine")
+        got = self.site.library()
+        self.assertEqual([r["id"] for r in got["runbooks"]], ["host-01/web"])
+        self.assertEqual(got["runbooks"][0]["status"], "REVIEWED")
+        self.assertEqual(len(got["cases"]), 1)
+        self.assertEqual([r["id"] for r in got["reports"]], [report])
+        self.assertIn("Status: REVIEWED", self.site.document("runbooks", "host-01/web"))
+        self.assertIn("all fine", self.site.document("reports", report))
+        self.assertIn("PAYMENT_URL", self.site.document("cases", got["cases"][0]["id"]))
+        for kind, key in (("runbooks", "../../etc/passwd"), ("runbooks", "host-01/../../x"), ("runbooks", "_cases/x/" + name[:-3]),
+                          ("reports", "../../etc/passwd"), ("reports", "x.md"), ("cases", "../x"), ("secrets", "x")):
+            self.assertIsNone(self.site.document(kind, key))
+
+    def test_health_keeps_when_each_problem_started_and_what_came_and_went(self):
+        rounds = [{"problems": {"a": "host: disk /data 95% used"}, "lines": []},
+                  {"problems": {"a": "host: disk /data 96% used", "b": "docker: web: Exited (1)"}, "lines": []},
+                  {"problems": {"a": "host: disk /data 96% used"}, "lines": []}]
+        with mock.patch.object(watch, "survey", lambda box: rounds.pop(0)):
+            for _ in range(3):
+                self.site.health.round()
+        state = self.site.health.state()
+        self.assertEqual([(p["text"], p["known"]) for p in state["problems"]], [("host: disk /data 96% used", True)])
+        self.assertEqual([(e["kind"], e["text"]) for e in state["events"]], [("ok", "docker: web: Exited (1)"), ("new", "docker: web: Exited (1)")])
+        self.assertEqual(len(web.Health(self.s, lambda line: None).events), 2)  # kept across a restart
+
+    def test_timeline_merges_changes_and_problems_newest_first(self):
+        now = int(__import__("time").time())
+        history.save(self.s, snapshot(now - 7200))
+        history.save(self.s, snapshot(now - 1800, image="shop/web:1.3"))
+        self.site.health.events = [{"time": now - 900, "kind": "new", "text": "pod shop/web-1: CrashLoopBackOff"}]
+        got = self.site.changes(6)
+        self.assertEqual([e["kind"] for e in got["events"]], ["problem", "change"])
+        self.assertEqual(got["events"][1]["where"], "a")
+        self.assertIn("image shop/web:1.2 -> shop/web:1.3", got["events"][1]["text"])
+        self.assertEqual(self.site.changes(0)["since"], now - 3600 if got["now"] == now else self.site.changes(0)["since"])
+        self.assertTrue(got["coverage"])
+
+    def test_the_page_loads_nothing_from_elsewhere_and_never_writes_markup(self):
+        for text in (webpage.INDEX, webpage.CSS, webpage.JS):
+            self.assertNotIn("http://", text)
+            self.assertNotIn("https://", text)
+        for risky in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "alert(", "confirm(", "prompt("):
+            self.assertNotIn(risky, webpage.JS)
+        self.assertNotIn(" style=", webpage.INDEX)
+        self.assertNotIn("onclick", webpage.INDEX.lower())
 
 
 class Launcher(unittest.TestCase):

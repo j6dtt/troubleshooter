@@ -14,6 +14,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
+from . import config, hosts
 from .redact import clean
 from .run import run
 
@@ -180,9 +181,10 @@ class Tool:
 
     def describe(self, args):
         try:
-            return self.say.format(**{k: ("" if v is None else v) for k, v in args.items()})
+            text = self.say.format(**{k: ("" if v is None else v) for k, v in args.items()})
         except (KeyError, IndexError):
-            return self.say
+            text = self.say
+        return f"{text.strip()} on {args['host']}" if args.get("host") else text
 
 
 def runbook_status(text):
@@ -306,7 +308,10 @@ def find_clusters(kube_dir):
 class Toolbox:
     def __init__(self, settings, clusters=None):
         self.s = settings
-        self.clusters = find_clusters(settings.kube_dir) if clusters is None else clusters
+        if clusters is None:
+            clusters = find_clusters(settings.kube_dir) if settings.kubernetes else {}
+        self.clusters = clusters
+        self.here, self.agents = config.here(), config.agents(settings)  # agents: only on the hub
         ids = tuple(self.clusters)
         current = re.sub(r"[^A-Za-z0-9_.\-]", "-", os.environ.get("KUBE_CURRENT", ""))
         self.active = current if current in self.clusters else next(iter(ids), None)
@@ -318,7 +323,24 @@ class Toolbox:
                 continue
             if t.needs_kube and t.per_cluster:
                 t.params = {"cluster": which, **t.params}
+            if self.agents and not (t.needs_kube or t.change or t.name in hosts.NOT_ASKED or t.name in ("k8s_contexts", "k8s_use_context")):
+                self._on_any_host(t)
             self.tools[t.name] = t
+
+    def _on_any_host(self, tool):
+        """On the hub, a tool that looks at one machine can look at another host's, through its agent."""
+        local = tool.fn
+        tool.params = {**tool.params, "host": P("string", f"Which host (default: this one, {self.here})", False,
+                                                (self.here, *self.agents))}
+
+        def routed(host=None, **args):
+            if not host or host == self.here:
+                return local(**args)
+            try:
+                return hosts.ask(self.s, host, tool.name, {k: v for k, v in args.items() if v is not None})
+            except hosts.Unreachable as e:
+                return f"Could not look at {host}: {e}"
+        tool.fn = routed
 
     def schemas(self):
         return [t.schema() for t in self.tools.values()]

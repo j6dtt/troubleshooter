@@ -8,12 +8,14 @@ Every host that runs from the same folder then sees it.
 A case is a lead written by a model, not proof. Chats are told to confirm it against live evidence.
 """
 import datetime
+import json
 import os
 import re
 import socket
 
 from .redact import mask, strip_control
 
+CHANGES = "changes.json"
 SHARED = "_cases"     # inside the runbooks folder, which every host already mounts
 MOST_CHARS = 6000     # of one case
 SHOWN = 3             # full cases returned by a search
@@ -50,11 +52,78 @@ def _text(path):
         return ""
 
 
+def _changes(settings):
+    """Edits and removals made on the page, waiting for ./ts to apply them to the shared folder."""
+    try:
+        with open(os.path.join(_local(settings), CHANGES), encoding="utf-8") as f:
+            found = json.load(f)
+        return found if isinstance(found, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _keep_changes(settings, changes):
+    os.makedirs(_local(settings), exist_ok=True)
+    path = os.path.join(_local(settings), CHANGES)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(changes, f)
+    os.replace(path + ".tmp", path)
+
+
 def all_cases(settings):
-    """[(host, name, text)], newest first. A case not yet copied to the shared folder is read from here."""
+    """[(host, name, text)], newest first. A case not yet copied to the shared folder is read from here,
+    and an edit or removal made on the page counts at once on this host."""
     paths = {**_scan(_local(settings)), **_scan(_shared(settings))}
-    rows = [(host, name, _text(path)) for (host, name), path in paths.items()]
+    changes = _changes(settings)
+    rows = []
+    for (host, name), path in paths.items():
+        change = changes.get(f"{host}/{name}") or {}
+        if not change.get("deleted"):
+            rows.append((host, name, change.get("text") or _text(path)))
     return sorted((r for r in rows if r[2]), key=lambda r: r[1], reverse=True)
+
+
+def find(settings, key):
+    """The text of one case, by "host/name", or None."""
+    return next((text for host, name, text in all_cases(settings) if f"{host}/{name}" == key), None)
+
+
+def _split(key):
+    host, _, name = key.partition("/")
+    if not NAME.match(name) or not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,100}$", host):
+        raise ValueError("not a case")
+    return host, name
+
+
+def remove(settings, key):
+    """Drops a case. One already in the shared folder goes from there when ./ts next runs on this host."""
+    host, name = _split(key)
+    here, there = _scan(_local(settings)), _scan(_shared(settings))
+    if (host, name) in here:
+        os.unlink(here[(host, name)])
+    changes = _changes(settings)
+    changes.pop(key, None)
+    if (host, name) in there:
+        changes[key] = {"deleted": True}
+    _keep_changes(settings, changes)
+
+
+def rewrite(settings, key, text):
+    """Replaces a case's text, masked. As for remove, the shared copy follows when ./ts next runs here."""
+    host, name = _split(key)
+    text = strip_control(mask(text)).strip()[:MOST_CHARS]
+    if not text:
+        raise ValueError("empty")
+    here, there = _scan(_local(settings)), _scan(_shared(settings))
+    changes = _changes(settings)
+    if (host, name) in there:
+        changes[key] = {"text": text + "\n"}
+        _keep_changes(settings, changes)
+    elif (host, name) in here:
+        with open(here[(host, name)], "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    else:
+        raise ValueError("not a case")
 
 
 def title(text):
@@ -106,15 +175,17 @@ def save(settings, text, context=""):
 
 
 def waiting(settings):
-    """{"host/name": text} of the cases saved here that the shared folder doesn't have yet."""
-    there = _scan(_shared(settings))
-    return {f"{host}/{name}": _text(path) for (host, name), path in _scan(_local(settings)).items()
+    """What ./ts must do in the shared folder: {"save": {"host/name": text}, "delete": ["host/name"]}."""
+    there, changes = _scan(_shared(settings)), _changes(settings)
+    save = {f"{host}/{name}": _text(path) for (host, name), path in _scan(_local(settings)).items()
             if (host, name) not in there}
+    save.update({key: c["text"] for key, c in changes.items() if c.get("text")})
+    return {"save": save, "delete": [key for key, c in changes.items() if c.get("deleted")]}
 
 
 def sent(settings, keys):
-    """./ts copied these to the shared folder: drop this host's copy of each one that really is there."""
-    here, there = _scan(_local(settings)), _scan(_shared(settings))
+    """./ts did these in the shared folder: drop what was kept here for each, once it really is so there."""
+    here, there, changes = _scan(_local(settings)), _scan(_shared(settings)), _changes(settings)
     for key in keys:
         host, _, name = key.partition("/")
         if (host, name) in here and (host, name) in there:
@@ -122,3 +193,40 @@ def sent(settings, keys):
                 os.unlink(here[(host, name)])
             except OSError:
                 pass
+        change = changes.get(key) or {}
+        if (change.get("deleted") and (host, name) not in there) or \
+                (change.get("text") and (host, name) in there and _text(there[(host, name)]).strip() == change["text"].strip()):
+            changes.pop(key)
+    _keep_changes(settings, changes)
+
+
+# ---------- incident reports ----------
+REPORT = re.compile(r"^\d{8}-\d{6}\.md$")
+
+
+def save_report(settings, text):
+    """Writes an incident report in the log folder. Returns its file name."""
+    now = datetime.datetime.now()
+    name = f"{now:%Y%m%d-%H%M%S}.md"
+    os.makedirs(os.path.join(settings.log_dir, "reports"), exist_ok=True)
+    with open(os.path.join(settings.log_dir, "reports", name), "w", encoding="utf-8") as f:
+        f.write(f"Incident report\nHost: {socket.gethostname()}\nMade: {now:%Y-%m-%d %H:%M}, by the model "
+                f"{settings.llm_model} from a troubleshooter chat. Check it before passing it on.\n\n{text}\n")
+    return name
+
+
+def reports(settings):
+    try:
+        return sorted((n for n in os.listdir(os.path.join(settings.log_dir, "reports")) if REPORT.match(n)), reverse=True)
+    except OSError:
+        return []
+
+
+def read_report(settings, name):
+    if not REPORT.match(name):
+        return None
+    try:
+        with open(os.path.join(settings.log_dir, "reports", name), encoding="utf-8", errors="replace") as f:
+            return strip_control(f.read(60_000))
+    except OSError:
+        return None

@@ -16,6 +16,8 @@ COMMANDS
   ./ts check               test Docker, contexts, logs, the model
   ./ts watch               watch health; speak only when it changes
   ./ts tools               list every tool it can use
+  ./ts setup               make the keys for several hosts (once)
+  ./ts user add NAME       an account for the web page
   ./ts --help              this guide
 
 IN THE CHAT
@@ -200,9 +202,81 @@ its machines and their VMs. Ask from any context:
 It finds the Supervisor context itself and lists only what is not
 ready, with VMware's reason (e.g. no host has enough memory, or a
 storage limit that is full). For a volume it follows the claim from
-the pod down to VMware's side. It does not switch your context. Nothing is ever changed on a Supervisor:
-the fix tools refuse it. No Supervisor in the list: log in to it with
-kubectl, then run ./ts again.
+the pod down to VMware's side. It does not switch your context.
+Nothing is ever changed on a Supervisor: the fix tools refuse it. No
+Supervisor in the list: log in to it with kubectl, then run ./ts again.
+
+SEVERAL HOSTS
+
+Every host runs the same code from the same folder. One is the hub;
+the others are agents that answer the hub about themselves.
+
+  hub      serves the web page, watches Kubernetes once for
+           everyone, and can look at the other hosts
+  agent    answers the hub on agent-port with its own Docker,
+           host and app files. It looks only: no fixes, no
+           Kubernetes, no shell.
+
+Set up, once:
+
+  1. In compose.yaml: hub-host and agent-hosts, as the command
+     "hostname" prints them on each host.
+  2. ./ts setup            (on any one host; the folder is shared)
+  3. docker compose up -d  (on every host)
+  4. ./ts check            (on the hub: every agent should answer)
+
+./ts setup writes a shared key and a certificate key to .env, and
+the certificate to certs/. They are never shown. Traffic between
+hosts is encrypted, and an agent answers only the hub.
+
+On the hub, ask about any host:
+
+  Why is relay unhealthy on host-02?
+  Which hosts have a container that isn't running?
+
+./ts on an agent host sees only that host. Fixes work only on the
+host you are typing on.
+
+WEB PAGE
+
+The hub serves a page at https://<hub host>:<web-port>.
+
+  ./ts user add NAME       add an account (asks for a password)
+  ./ts user remove NAME
+  ./ts user list
+  docker compose up -d     on the hub, after any of these
+
+The page looks only: it never changes anything. Fixes stay in ./ts.
+
+  Chat           each step's full output is shown beside the answer
+  Health         open problems first, then everything watched
+  What changed   a timeline of changes, problems and recording gaps
+  Library        cases, runbooks and reports; cases can be edited
+                 and deleted
+
+A case saved, edited or deleted on the page counts on the hub at
+once. The other hosts see it after ./ts next runs on the hub.
+
+The certificate is our own, so a browser warns the first time. To
+use one from your own CA for the page:
+
+  ./ts setup --web-cert CERT.pem KEY.pem
+  docker compose up -d     on the hub
+
+Both files in PEM form; the key without a passphrase; the hub's
+name, as typed in the browser, in the certificate. It is copied to
+certs/web-cert.pem and its key goes to .env. Hosts still talk to
+each other with the certificate ./ts setup made. To go back:
+./ts setup --web-cert remove. ./ts check says when either
+certificate runs out.
+
+Accounts are kept in .env as hashes, never as passwords.
+
+DOCKER ONLY
+
+Set kubernetes: "off" in compose.yaml, then docker compose up -d.
+No cluster tools, no kubectl proxies, and nothing about clusters in
+check, watch, what changed or the page.
 
 SOURCE CODE
 
@@ -264,11 +338,21 @@ docker compose up -d. Secrets go in .env.
   learn-llm-model      = same as the chat. ./ts check tests it.
   record-minutes       background snapshots of Docker, with no
                        chat open; 0 = off
+  kubernetes           off = Docker and host only
+  hub-host             the host that serves the page and looks at
+                       the others; empty = this host stands alone
+  agent-hosts          the other hosts, separated by commas;
+                       name=address if a name does not resolve
+  agent-port           port the agents listen on (8001)
+  web-port             port of the web page (9001)
 
   LLM_API_KEY in .env  the model's key; empty for vLLM
   LEARN_LLM_API_KEY    in .env: the learn model's key, if its
                        server needs one. The chat's key is never
                        sent to another server.
+  AGENT_KEY, TLS_KEY   in .env: written by ./ts setup
+  WEB_TLS_KEY          in .env: written by ./ts setup --web-cert
+  WEB_USERS            in .env: written by ./ts user add
 
 WHEN SOMETHING IS WRONG
 
@@ -293,10 +377,19 @@ WHEN SOMETHING IS WRONG
       Type /new.
   Not running, or "service is not running"
       docker compose up -d
+  An agent did not answer
+      On that host: docker compose up -d, then ./ts check there.
+  An agent refused: not the hub's address
+      The hub has several addresses. Write hub-host as name=address.
+  The encrypted connection failed
+      Both hosts need the same certs/ folder and the same .env.
+  The web page is not served
+      ./ts user add NAME, then docker compose up -d on the hub.
 
 FILES
 
-  logs/<date>.log    what happened, with every approval and decline
+  logs/<date>.log    what happened, with every approval and decline,
+                     what the hub asked an agent, and who signed in
   kube/              optional service-account logins, one per cluster
   README.md          design and air-gapped install
 
@@ -308,3 +401,5 @@ SAFETY
   Logs may hold hostile text; the model is told to treat it as data.
   The model can be wrong. Check its evidence before you approve.
   Anyone who can run ./ts has Docker admin rights.
+  Anyone with a page account can read what the hub's logins can see,
+  on every host and cluster. The page can't change anything.
