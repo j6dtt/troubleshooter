@@ -1,4 +1,5 @@
 """python -m unittest discover tests  (no network, no Docker needed)"""
+import gzip
 import io
 import json
 import os
@@ -826,6 +827,25 @@ class History(unittest.TestCase):
         history.save(self.s, snapshot(2000, image="shop/web:1.3"))
         self.assertEqual(len(os.listdir(history.folder(self.s))), 1)
 
+    def test_each_host_keeps_its_own_snapshots_in_the_shared_folder(self):
+        shared = os.path.join(self.s.log_dir, "snapshots")
+        os.makedirs(shared)
+        with open(os.path.join(shared, "19700101-000500.json"), "w") as f:   # from before: every host's, mixed
+            json.dump(snapshot(300, image="shop/web:0.9"), f)
+        for host, image in (("host-01", "shop/web:1.1"), ("host-02", "shop/web:2.2")):
+            with mock.patch.object(config.socket, "gethostname", lambda h=host: h):
+                history.save(self.s, {**snapshot(1000, image=image), "host": host})
+        self.assertEqual(sorted(os.listdir(shared)), ["host-01", "host-02"])   # the mixed one is gone
+        with mock.patch.object(config.socket, "gethostname", lambda: "host-01"):
+            got, _ = history.before(self.s, 2000)
+            self.assertEqual(got["k8s"]["a"]["workloads"]["deployment shop/web"]["images"], ["shop/web:1.1"])
+            self.assertEqual(got["host"], "host-01")
+            mine = os.path.join(shared, "host-01", os.listdir(os.path.join(shared, "host-01"))[0])
+        with gzip.open(mine, "wt") as f:   # another host's snapshot in this one's folder is never used
+            json.dump({**snapshot(1000), "host": "host-02"}, f)
+        with mock.patch.object(config.socket, "gethostname", lambda: "host-01"):
+            self.assertEqual(history.before(self.s, 2000), (None, None))
+
     def test_folder_never_passes_its_size_limit(self):
         with mock.patch.object(history, "MOST_BYTES", 2500):
             for n in range(12):
@@ -1253,6 +1273,29 @@ class Roles(unittest.TestCase):
             self.assertEqual(t.describe({"container": "web", "host": "host-02"}), "Read logs of container web on host-02")
             with self.assertRaises(tools.BadInput):
                 t.check({"container": "web", "host": "host-99"})
+
+    def test_what_changed_on_the_hub_looks_at_every_host_each_under_its_name(self):
+        patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02", "host-03"))
+        asked = []
+
+        def ask(settings, host, tool, args=None, timeout=90):
+            asked.append((host, tool))
+            if host == "host-02":
+                return "- new container relay"
+            raise hosts.Unreachable("no answer")
+        with patch, mock.patch.object(hosts, "ask", ask), mock.patch.object(history, "what_changed", lambda box, since: "- new container web"):
+            box = tools.Toolbox(s, clusters={})
+            t = box.tools["what_changed"]
+            out = t.fn(**t.check({"since": "6h"}))
+            self.assertEqual(sorted(asked), [("host-02", "what_changed"), ("host-03", "what_changed")])
+            self.assertLess(out.index("=== HOST host-01"), out.index("- new container web"))
+            self.assertLess(out.index("- new container web"), out.index("=== HOST host-02"))
+            self.assertLess(out.index("=== HOST host-02"), out.index("- new container relay"))
+            self.assertIn("Could not look at host-03: no answer", out)
+            asked.clear()
+            self.assertEqual(t.fn(**t.check({"since": "6h", "host": "host-01"})), "- new container web")
+            self.assertEqual(t.fn(**t.check({"since": "6h", "host": "host-02"})), "- new container relay")
+            self.assertEqual(asked, [("host-02", "what_changed")])
 
     def test_model_is_told_about_the_other_hosts(self):
         patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02",), llm_url="http://x", llm_model="m", kube_dir="/none")

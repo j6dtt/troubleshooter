@@ -71,8 +71,10 @@ Kubernetes contexts you can reach: {clusters}. The active one at the start is {a
 HOSTS = """
 
 You are on the hub host {here}. You can also look at these other hosts: {others}. The Docker, Swarm, host and
-file tools take a host argument; without it they look at {here}.
-- Containers, files and logs on different hosts are different things. Say which host each finding is from.
+file tools take a host argument; without it they look at {here}. what_changed is the exception: without a host
+it answers for every host, each under a "=== HOST name ===" heading.
+- Containers, files and logs on different hosts are different things. Say which host each finding is from, and
+  take it only from the heading or the host argument it came under. Never guess where a container runs.
 - For a question about "everything", look at each host: overview and docker_list take host too.
 - You can only change things on {here}. For a fix on another host, tell the operator to run ./ts there.
 - If a host did not answer, say so and carry on with the others."""

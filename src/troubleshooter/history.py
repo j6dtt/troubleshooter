@@ -5,7 +5,7 @@ Kubernetes keeps little history and Docker almost none, so the state is written 
 differs from the last one, so quiet days cost almost nothing. They are compressed, at most 7 days
 old, and the folder never passes 50 MB: the oldest are removed first.
 
-Snapshots live in the log folder, which is local to each host. They hold names, images, counts and
+Snapshots live in logs/snapshots/<host>: the log folder is shared by every host, so each keeps its own. They hold names, images, counts and
 states; never settings, environment values or Secrets.
 """
 import calendar
@@ -16,6 +16,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from . import config
 from .run import run
 from .tools import CLUSTER_LABEL, VKS_KINDS
 
@@ -41,7 +42,8 @@ def clock(seconds):
 
 
 def folder(settings):
-    return os.path.join(settings.log_dir, "snapshots")
+    """This host's own snapshots. The log folder is shared, so one host must never read another's as its own."""
+    return os.path.join(settings.log_dir, "snapshots", config.here())
 
 
 # ---------- taking a snapshot ----------
@@ -137,7 +139,7 @@ def take(box):
     with ThreadPoolExecutor(max_workers=8) as pool:
         docker = pool.submit(_docker)
         kube = dict(zip(box.clusters, pool.map(lambda cid: _kube(box, cid), box.clusters)))
-        return {"time": int(time.time()), "docker": docker.result(), "k8s": kube}
+        return {"time": int(time.time()), "host": config.here(), "docker": docker.result(), "k8s": kube}
 
 
 # ---------- keeping snapshots ----------
@@ -160,9 +162,12 @@ def _taken(name):
 def _read(settings, name):
     try:
         with (gzip.open if name.endswith(".gz") else open)(os.path.join(folder(settings), name), "rt", encoding="utf-8") as f:
-            return json.load(f)
+            snap = json.load(f)
     except (OSError, ValueError, EOFError):
         return None
+    if not isinstance(snap, dict) or snap.get("host") not in (None, config.here()):
+        return None  # another host's: never compare it with this one
+    return snap
 
 
 def _tidy(settings):
@@ -170,6 +175,13 @@ def _tidy(settings):
 
     The oldest go first. The newest file always stays: it is what the next snapshot is compared with.
     """
+    shared = os.path.dirname(folder(settings))
+    for name in os.listdir(shared):  # from before each host had its own folder: every host's, mixed up
+        if name.endswith((".json.gz", ".json", ".tmp")) and os.path.isfile(os.path.join(shared, name)):
+            try:
+                os.unlink(os.path.join(shared, name))
+            except OSError:
+                pass
     sizes = []
     for name in os.listdir(folder(settings)):
         path = os.path.join(folder(settings), name)
@@ -186,7 +198,7 @@ def _tidy(settings):
 
 
 def _same(a, b):
-    return a is not None and b is not None and {**a, "time": 0} == {**b, "time": 0}
+    return a is not None and b is not None and {**a, "time": 0, "host": 0} == {**b, "time": 0, "host": 0}
 
 
 def _merge(last, snap):
@@ -196,7 +208,7 @@ def _merge(last, snap):
     known = last.get("k8s") or {}
     # A context this snapshot does not cover (taken with no login open) keeps its last known state too.
     kube = {**known, **{cid: part if part is not None else known.get(cid) for cid, part in snap["k8s"].items()}}
-    return {"time": snap["time"], "docker": snap["docker"] if snap["docker"] is not None else last.get("docker"), "k8s": kube}
+    return {"time": snap["time"], "host": snap.get("host", last.get("host")), "docker": snap["docker"] if snap["docker"] is not None else last.get("docker"), "k8s": kube}
 
 
 def save(settings, snap):
@@ -389,7 +401,7 @@ def what_changed(box, since_seconds):
         first = oldest(box.s)
         if first is None or first["time"] >= now["time"] - 60:
             text.append("Nothing was recorded before now, so there is no earlier state to compare with. Recording "
-                        "has started: it runs while a chat or ./ts watch is open.")
+                        "has started: the container keeps it going every record-minutes.")
         else:
             old = first
             text.append(f"Nothing was recorded before {clock(start)}. Compared with the oldest record instead, "

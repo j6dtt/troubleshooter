@@ -18,6 +18,7 @@ from . import config, hosts
 from .redact import clean
 from .run import run
 
+EVERY_HOST = {"what_changed"}   # on the hub, with no host named, these look at every host
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,252}$")
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache",
              ".pytest_cache", "dist", "build", "target", ".gradle", ".idea", "vendor"}
@@ -330,16 +331,28 @@ class Toolbox:
     def _on_any_host(self, tool):
         """On the hub, a tool that looks at one machine can look at another host's, through its agent."""
         local = tool.fn
-        tool.params = {**tool.params, "host": P("string", f"Which host (default: this one, {self.here})", False,
+        everywhere = tool.name in EVERY_HOST
+        default = "every host, each under its own heading" if everywhere else f"this one, {self.here}"
+        tool.params = {**tool.params, "host": P("string", f"Which host (default: {default})", False,
                                                 (self.here, *self.agents))}
 
-        def routed(host=None, **args):
-            if not host or host == self.here:
-                return local(**args)
+        def there(host, args):
             try:
                 return hosts.ask(self.s, host, tool.name, {k: v for k, v in args.items() if v is not None})
             except hosts.Unreachable as e:
                 return f"Could not look at {host}: {e}"
+
+        def routed(host=None, **args):
+            if host and host != self.here:
+                return there(host, args)
+            if not (everywhere and not host):
+                return local(**args)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                others = list(pool.map(lambda h: there(h, args), self.agents))
+            parts = [f"=== HOST {self.here} (this host; Kubernetes is looked at from here) ===", local(**args)]
+            for h, text in zip(self.agents, others):
+                parts += ["", f"=== HOST {h} (its own Docker only) ===", text]
+            return "\n".join(parts)
         tool.fn = routed
 
     def schemas(self):
