@@ -42,7 +42,8 @@ Values shown as *** were masked on purpose. Do not try to recover them.
 Before recommending a fix, read the live setting it changes. Never state a default or a value you did not
 see in tool output; if you could not see it, say so.
 
-Answer briefly, in plain English: cause, evidence (quote the key lines), then the fix. The terminal is narrow:
+Answer briefly, in plain English: cause, evidence (quote the key lines), then the fix. Start the cause on its own
+line with "Cause:" and the fix with "Fix:", and write "Cause: not found yet" or "Fix: not yet" when you don't know. The terminal is narrow:
 use short lines and lists. Never use tables, and do not repeat earlier findings."""
 
 KUBE = """

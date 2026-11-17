@@ -167,6 +167,8 @@ class Agent:
             return True, json.dumps(watch.local_problems(self.box))
         if tool == "_survey":
             return True, json.dumps(watch.local_survey(self.box))
+        if tool == "_map":
+            return True, json.dumps(watch.local_map(self.box))
         if tool == "_events":
             return True, json.dumps(history.events(self.s, int(args.get("since", 0))))
         if tool == "_coverage":

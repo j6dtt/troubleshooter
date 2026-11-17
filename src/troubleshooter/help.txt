@@ -1,4 +1,4 @@
-TROUBLESHOOTER
+TRACER
 
 Chat with an AI model that inspects Docker, Swarm, Kubernetes, this
 host and your app source code. It looks freely, and changes something
@@ -248,11 +248,20 @@ The hub serves a page at https://<hub host>:<web-port>.
 
 The page looks only: it never changes anything. Fixes stay in ./ts.
 
-  Chat           each step's full output is shown beside the answer
-  Health         open problems first, then everything watched
-  What changed   a timeline of changes, problems and recording gaps
+  Trace          the chat, drawn as a trail: symptom, evidence,
+                 cause, fix. Select a step to see its full output.
+  Map            each host's containers as squares, and each
+                 cluster; select a square for its logs and changes.
+                 Open problems are listed beside it.
+  What changed   one lane per host and cluster: changes, problems
+                 and gaps in recording. Pick some to trace together.
+  Console        a status wall: problem count, last hour per host,
+                 live feed. Full screen for a big monitor.
   Library        cases, runbooks and reports; cases can be edited
                  and deleted
+
+"Trace this" on the Map, and "Trace these" in What changed, open
+the Trace with the question written and the host chosen.
 
 A case saved, edited or deleted on the page counts on the hub at
 once. The other hosts see it after ./ts next runs on the hub.

@@ -902,6 +902,27 @@ class History(unittest.TestCase):
 
 
 class Watch(unittest.TestCase):
+    def test_each_problem_belongs_to_a_lane(self):
+        agents = {"host-02": "host-02"}
+        for k, want in (("host-01 DOCKER|relay|x", "host-01"), ("host-02 agent", "host-02"), ("KUBERNETES vks-a|pod|x", "vks-a"),
+                        ("vks sup prod1|machine|x", "sup"), ("DOCKER|web|x", "host-01")):
+            self.assertEqual(watch.lane(k, "host-01", agents), want)
+
+    def test_map_lists_each_container_with_its_state(self):
+        box = mock.Mock(_docker_rows=lambda: [
+            {"Names": "web", "State": "running", "Status": "Up 2 hours", "Image": "web:1"},
+            {"Names": "relay", "State": "running", "Status": "Up 1 minute (unhealthy)", "Image": "relay:5"},
+            {"Names": "helper", "State": "running", "Status": "Up 1 second", "Image": "ts:1"},
+            {"Names": "old", "State": "exited", "Status": "Exited (1) 2 days ago", "Image": "old:1"}],
+            _meminfo=lambda: {"MemTotal": 1000, "MemAvailable": 250}, _disks=lambda: [(91, "/data: 91% used")])
+        detail = {"web": {"restarts": 0}, "relay": {"restarts": 7}, "old": {}}
+        with mock.patch.object(history, "_docker", lambda: detail):
+            got = watch.local_map(box)
+        self.assertEqual([(c["name"], c["state"]) for c in got["containers"]], [("old", "exited"), ("relay", "unhealthy"), ("web", "running")])
+        self.assertEqual(got["containers"][1]["restarts"], 7)
+        self.assertEqual(got["memory"], [750, 1000])
+        self.assertEqual(got["disks"], [[91, "/data"]])
+
     def run_watch(self, docker_rounds, argv=(), kube=None, agents=None):
         box = mock.Mock(clusters={"vks": None} if kube else {}, roles={"vks": "workload"}, agents=agents or {}, here="host-01", s=Settings())
         box._disks.return_value = [(95, "/data: 95% used, 1.0 GB free of 20.0 GB"), (40, "/: 40% used")]
@@ -1600,9 +1621,51 @@ class Page(unittest.TestCase):
         got = self.site.changes(6)
         self.assertEqual([e["kind"] for e in got["events"]], ["problem", "change"])
         self.assertEqual(got["events"][1]["where"], "a")
+        self.assertEqual(got["events"][1]["lane"], "a")
+        self.assertEqual(got["lanes"], [self.site.health.box.here])
+        self.assertIn(self.site.health.box.here, got["coverage"])
         self.assertIn("image shop/web:1.2 -> shop/web:1.3", got["events"][1]["text"])
         self.assertEqual(self.site.changes(0)["since"], now - 3600 if got["now"] == now else self.site.changes(0)["since"])
-        self.assertTrue(got["coverage"])
+        self.assertTrue(got["coverage"][self.site.health.box.here])
+
+    def test_map_shows_each_host_with_its_containers_and_problems_by_lane(self):
+        with mock.patch.object(watch, "survey", lambda box: {"problems": {"DOCKER|relay|restarting": "docker: relay: Restarting"},
+                                                             "lines": [{"kind": "Kubernetes", "where": "vks-a", "line": "3 nodes", "problems": 0}]}), \
+                mock.patch.object(web.Health, "_hosts", lambda self: [{"name": self.box.here, "containers": []}]):
+            self.site.health.round()
+        state = self.site.health.state()
+        self.assertEqual(state["problems"][0]["lane"], self.site.health.box.here)
+        self.assertEqual(state["hosts"][0]["name"], self.site.health.box.here)
+        self.assertEqual(state["clusters"], [{"name": "vks-a", "kind": "Kubernetes", "line": "3 nodes", "problems": 0}])
+
+    def test_a_host_that_cannot_say_is_shown_with_the_reason(self):
+        patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02", "host-03"), kube_dir="/none", log_dir=self.s.log_dir)
+
+        def ask(settings, host, tool, args=None, timeout=90):
+            if host == "host-02":
+                return json.dumps({"containers": [{"name": "relay", "state": "restarting"}]})
+            if host == "host-03":
+                return "Refused: _map is not a tool this agent answers."
+            raise AssertionError
+        with patch, mock.patch.object(hosts, "ask", ask), mock.patch.object(watch, "local_map", lambda box: {"containers": []}):
+            got = {h["name"]: h for h in web.Health(s, lambda line: None)._hosts()}
+        self.assertEqual(got["host-01"]["role"], "hub")
+        self.assertEqual(got["host-02"]["containers"][0]["name"], "relay")
+        self.assertIn("older than this page", got["host-03"]["error"])
+
+    def test_one_container_shows_its_logs_and_changes(self):
+        box = self.site.health.box
+        box.tools["docker_logs"].fn = lambda **a: "line 1\nline 2" if a["container"] == "relay" else "?"
+        now = int(__import__("time").time())
+        self.site.health.events = [{"time": now - 60, "kind": "new", "text": "docker: relay: Restarting", "lane": box.here},
+                                   {"time": now - 60, "kind": "new", "text": "docker: web: Exited", "lane": box.here}]
+        got = self.site.container(box.here, "relay")
+        self.assertEqual(got["logs"], "line 1\nline 2")
+        self.assertEqual([e["text"] for e in got["changes"]], ["docker: relay: Restarting"])
+        with self.assertRaises(tools.BadInput):
+            self.site.container("host-99", "relay")
+        with self.assertRaises(tools.BadInput):
+            self.site.container(box.here, "../x")
 
     def test_the_page_loads_nothing_from_elsewhere_and_never_writes_markup(self):
         for text in (webpage.INDEX, webpage.CSS, webpage.JS):

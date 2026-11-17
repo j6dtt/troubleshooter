@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import cases, config, history, hosts, llm, watch, webpage
 from .engine import Session
 from .redact import mask, strip_control
-from .tools import BadInput, Toolbox
+from .tools import NAME, BadInput, Toolbox
 
 SESSION_HOURS = 12
 MOST_CHATS = 40
@@ -112,7 +112,7 @@ class Chat:
         return True
 
     def ask(self, question, host):
-        self.add("ask", d=question)
+        self.add("ask", d=question, time=int(time.time()))
         if host and host in self.session.box.agents:
             self.session.note = f"(The operator is asking about the host {host}.)\n" + self.session.note
         self.session.ask(question)
@@ -145,6 +145,7 @@ class Health:
         self.box = Toolbox(dataclasses.replace(settings, allow_changes=False))
         self.lock = threading.Lock()
         self.open, self.lines, self.checked, self.failed = {}, [], 0, ""
+        self.hosts = []
         self.path = os.path.join(settings.log_dir, "watch-events.jsonl")
         self.events = self._load()
 
@@ -167,27 +168,51 @@ class Health:
         except OSError:
             pass
 
+    def _hosts(self):
+        """Every host's containers and fill, for the map. A host that can't say is shown with the reason."""
+        box = self.box
+
+        def one(host):
+            if host == box.here:
+                found = watch.local_map(box)
+            else:
+                try:
+                    found = json.loads(hosts.ask(self.s, host, "_map", timeout=45))
+                    if not isinstance(found, dict):
+                        raise ValueError("not a map")
+                except hosts.Unreachable as e:
+                    found = {"error": str(e)}
+                except ValueError:
+                    found = {"error": "its agent is older than this page: copy the new .py files there"}
+            return {"name": host, "role": "hub" if box.agents and host == box.here else "agent" if host != box.here else "",
+                    **found}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(one, [box.here, *box.agents]))
+
     def round(self):
         try:
-            seen = watch.survey(self.box)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                seen, found = pool.submit(watch.survey, self.box), pool.submit(self._hosts)
+                seen, found = seen.result(), found.result()
         except Exception as e:
             with self.lock:
                 self.failed = str(e)
             return
         now, new = int(time.time()), []
+        where = lambda k: watch.lane(k, self.box.here, self.box.agents)
         with self.lock:
             first = not self.checked
             for k, text in seen["problems"].items():
                 if k not in self.open:
-                    self.open[k] = {"text": text, "since": now, "known": first}
+                    self.open[k] = {"text": text, "since": now, "known": first, "lane": where(k)}
                     if not first:
-                        new.append({"time": now, "kind": "new", "text": text})
+                        new.append({"time": now, "kind": "new", "text": text, "lane": where(k)})
                         self.log(f"The page's watch found a new problem: {text}")
                 else:
                     self.open[k]["text"] = text
             for k in [k for k in self.open if k not in seen["problems"]]:
-                new.append({"time": now, "kind": "ok", "text": self.open.pop(k)["text"]})
-            self.lines, self.checked, self.failed = seen["lines"], now, ""
+                new.append({"time": now, "kind": "ok", "text": self.open.pop(k)["text"], "lane": where(k)})
+            self.lines, self.hosts, self.checked, self.failed = seen["lines"], found, now, ""
             self.events += new
         if new:
             self._keep(new)
@@ -200,9 +225,11 @@ class Health:
     def state(self):
         with self.lock:
             return {"checked": self.checked, "every": HEALTH_EVERY, "failed": self.failed,
-                    "problems": sorted(({"text": p["text"], "since": p["since"], "known": p["known"]} for p in self.open.values()),
-                                       key=lambda p: -p["since"]),
-                    "lines": self.lines, "events": self.events[-60:][::-1]}
+                    "problems": sorted(({"text": p["text"], "since": p["since"], "known": p["known"], "lane": p["lane"]}
+                                        for p in self.open.values()), key=lambda p: -p["since"]),
+                    "lines": self.lines, "hosts": self.hosts, "events": self.events[-60:][::-1],
+                    "clusters": [{"name": c["where"], "kind": c["kind"], "line": c["line"], "problems": c["problems"]}
+                                 for c in self.lines if c["kind"] in ("Kubernetes", "VKS cluster")]}
 
     def problem_events(self, since):
         with self.lock:
@@ -280,32 +307,52 @@ class Site:
         now = int(time.time())
         since = now - max(1, min(hours, 24 * history.KEEP_DAYS)) * 3600
         box = self.health.box
-        found = [{**e, "kind": "change", "where": e["where"] if e["where"] != "Docker" else f"Docker on {box.here}"}
+        found = [{**e, "kind": "change", "lane": box.here if e["where"] == "Docker" else e["where"],
+                  "where": e["where"] if e["where"] != "Docker" else f"Docker on {box.here}"}
                  for e in history.events(self.s, since)]
+        own = history.coverage(self.s, since)
+        coverage = {box.here: own, **{cid: own for cid in box.clusters}}
 
         def other(host):
             try:
-                return [{**e, "kind": "change", "where": f"{e.get('where', 'Docker')} on {host}"}
+                rows = [{**e, "kind": "change", "lane": host, "where": f"{e.get('where', 'Docker')} on {host}"}
                         for e in json.loads(hosts.ask(self.s, host, "_events", {"since": since}, timeout=30))]
+                spans = json.loads(hosts.ask(self.s, host, "_coverage", {"since": since}, timeout=30))
+                return host, rows, spans
             except (hosts.Unreachable, ValueError):
-                return []
+                return host, [], None
         with ThreadPoolExecutor(max_workers=8) as pool:
-            for rows in pool.map(other, box.agents):
+            for host, rows, spans in pool.map(other, box.agents):
                 found += rows
+                coverage[host] = spans
         if now - self._kube[0] > 60:  # what the clusters themselves record; asked at most once a minute
             def own(cid):
                 try:
-                    return [{"time": when, "where": cid, "text": text, "kind": "cluster"}
+                    return [{"time": when, "where": cid, "lane": cid, "text": text, "kind": "cluster"}
                             for when, text in history.timeline_rows(box, cid, now - 24 * history.KEEP_DAYS * 3600)]
                 except Exception:
                     return []
             with ThreadPoolExecutor(max_workers=8) as pool:
                 self._kube = (now, [row for rows in pool.map(own, list(box.clusters)) for row in rows])
         found += [e for e in self._kube[1] if e["time"] >= since]
-        found += [{"time": e["time"], "where": "", "text": e["text"], "kind": "problem" if e["kind"] == "new" else "cleared"}
-                  for e in self.health.problem_events(since)]
+        found += [{"time": e["time"], "where": e.get("lane", ""), "lane": e.get("lane", box.here), "text": e["text"],
+                   "kind": "problem" if e["kind"] == "new" else "cleared"} for e in self.health.problem_events(since)]
         found.sort(key=lambda e: -e["time"])
-        return {"since": since, "now": now, "events": found[:800], "coverage": history.coverage(self.s, since)}
+        return {"since": since, "now": now, "events": found[:800], "lanes": [box.here, *box.agents, *box.clusters],
+                "coverage": coverage}
+
+    # --- one container, for the map ---
+    def container(self, host, name):
+        box = self.health.box
+        if host not in (box.here, *box.agents):
+            raise BadInput(f"{host} is not one of the hosts.")
+        if not NAME.match(name):
+            raise BadInput("That is not a container name.")
+        logs = box.tools["docker_logs"]
+        text = logs.fn(**logs.check({"container": name, "tail": 30, **({"host": host} if box.agents else {})}))
+        word = name.lower()
+        changed = [e for e in self.changes(24)["events"] if e.get("lane") == host and word in e["text"].lower()][:8]
+        return {"logs": box.out(str(text)), "changes": changed}
 
     # --- the library ---
     def library(self):
@@ -415,6 +462,11 @@ def _handler(site):
                     "hosts": [box.here, *box.agents], "contexts": list(box.clusters)})
             if parts == ["health"]:
                 return self._send(200, site.health.state())
+            if parts == ["container"]:
+                try:
+                    return self._send(200, site.container(query.get("host", ""), query.get("name", "")))
+                except BadInput as e:
+                    return self._send(400, {"error": str(e)})
             if parts == ["changes"]:
                 return self._send(200, site.changes(int(query.get("hours", "6"))))
             if parts == ["library"]:

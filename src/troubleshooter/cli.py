@@ -34,6 +34,39 @@ def paint(code, text):
     return f"\033[{code}m{text}\033[0m" if TTY else text
 
 
+LOGO = """\
+████████╗██████╗  █████╗  ██████╗███████╗██████╗
+╚══██╔══╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔══██╗
+   ██║   ██████╔╝███████║██║     █████╗  ██████╔╝
+   ██║   ██╔══██╗██╔══██║██║     ██╔══╝  ██╔══██╗
+   ██║   ██║  ██║██║  ██║╚██████╗███████╗██║  ██║
+   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝"""
+SHADES = (51, 45, 39, 33, 27, 63)   # cyan down to blue, one per line
+
+
+def intro(settings, box):
+    """The start of a chat: the name, then where you are and what it can see."""
+    kind = config.role(settings)
+    where = {"hub": f"hub, {len(box.agents)} other host(s)", "agent": f"agent of {config.short(settings.hub_host)}",
+             "alone": "on its own"}[kind]
+    clusters = f"{len(box.clusters)} context(s)" if box.clusters else ("off" if not settings.kubernetes else "no login")
+    facts = [("host", f"{box.here} ({where})"), ("model", settings.llm_model), ("kubernetes", clusters)]
+    fancy = TTY and shutil.get_terminal_size((80, 24)).columns >= 52 and "UTF" in (sys.stdout.encoding or "").upper()
+    if not fancy:
+        print(f"Tracer {__version__}  host {box.here}  model {settings.llm_model}")
+        return
+    print()
+    for shade, line in zip(SHADES, LOGO.splitlines()):
+        print(f"  \033[1;38;5;{shade}m{line}\033[0m")
+    trail = ("\033[38;5;240m  ─" + "\033[38;5;45m●\033[38;5;240m─────" * 3 + "\033[38;5;51m▶\033[0m"
+             "  \033[2msymptom → evidence → cause → fix\033[0m")
+    print(trail)
+    print(f"  \033[2mv{__version__} · looks freely, changes only after you say yes\033[0m\n")
+    for name, value in facts:
+        print(f"  \033[38;5;45m{name:<11}\033[0m{value}")
+    print()
+
+
 class Spinner:
     """Shows that a slow model is still working, until the first text arrives."""
 
@@ -136,8 +169,8 @@ def chat(settings):
     log = make_log(settings)
     session = Session(settings, ui, log)
     keep_history(session.box)
-    print(paint("1", f"Troubleshooter {__version__}") + f"  model: {settings.llm_model}")
-    print("Type /help for commands.\n")
+    intro(settings, session.box)
+    print(paint("2", "  Type /help for commands, /quit to leave.") + "\n")
     log(f"Chat started with model {settings.llm_model}")
     while True:
         try:

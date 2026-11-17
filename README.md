@@ -1,4 +1,4 @@
-# Troubleshooter
+# Tracer
 
 Terminal chat with an AI model that can inspect Docker, Swarm, Kubernetes,
 the host and app files, and fix things once you approve.

@@ -142,8 +142,8 @@ docker compose up -d
 ./ts check
 ```
 
-Each cluster appears as `[ok] Context vks.<name>`, and the Health
-section of the page then shows them.
+Each cluster appears as `[ok] Context vks.<name>`, and the Map on
+the page then shows them.
 
 Two things to know:
 

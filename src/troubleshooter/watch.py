@@ -70,6 +70,48 @@ def local_survey(box):
     return {"problems": found, "lines": lines}
 
 
+def local_map(box):
+    """This machine for the page's map: each container, and how busy and full the host is."""
+    found = {"containers": [], "load": None, "memory": None, "disks": [], "error": ""}
+    try:
+        rows = box._docker_rows()
+    except RuntimeError as e:
+        rows, found["error"] = [], f"Docker is not reachable: {e}"
+    detail = history._docker() or {}
+    for c in rows:
+        name, status = c.get("Names", "?"), c.get("Status", "")
+        if detail and name not in detail:
+            continue  # a short-lived helper of this tool
+        d = detail.get(name, {})
+        state = ("restarting" if "Restarting" in status or c.get("State") == "restarting"
+                 else "unhealthy" if "unhealthy" in status else c.get("State") or "?")
+        found["containers"].append({"name": name, "state": state, "status": status, "image": c.get("Image") or d.get("image"),
+                                    "restarts": d.get("restarts", 0), "started": d.get("started")})
+    found["containers"].sort(key=lambda c: (c["state"] == "running", c["name"]))
+    try:
+        m = box._meminfo()
+        with open("/proc/loadavg") as f:
+            found["load"] = float(f.read().split()[0])
+        found["cpus"] = os.cpu_count() or 1
+        found["memory"] = [m["MemTotal"] - m["MemAvailable"], m["MemTotal"]]
+        found["disks"] = [[used, text.split(":")[0]] for used, text in box._disks()]
+    except (OSError, KeyError, ValueError, IndexError):
+        pass
+    return found
+
+
+def lane(k, here, agents):
+    """Which host or cluster a problem's key is about: the page draws one lane for each."""
+    first = k.split(" ", 1)[0]
+    if first == here or first in agents:
+        return first
+    if k.startswith("KUBERNETES "):
+        return k.split("|")[0].split(" ")[1]
+    if k.startswith("vks "):
+        return k.split(" ")[1]
+    return here
+
+
 def local_problems(box):
     return local_survey(box)["problems"]
 
