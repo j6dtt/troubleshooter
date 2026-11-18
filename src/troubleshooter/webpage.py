@@ -49,6 +49,11 @@ INDEX = r'''<!doctype html>
       <h1 id="trace-title" class="title">New trace</h1>
       <p id="trace-sub" class="muted">Ask about a problem. Tracer looks, and draws the trail from symptom to fix.</p>
     </div>
+    <div id="trace-auto" class="card auto-note" hidden>
+      <span>Tracer started this trace by itself when the watch found the problem. Everyone can read it and ask more.</span>
+      <span class="grow"></span>
+      <button type="button" id="back-mine">Back to my trace</button>
+    </div>
     <ol class="trail" aria-label="Trail">
       <li id="stage-1" class="stage"><span class="dot">1</span><span><b>Symptom</b><span class="detail">not asked yet</span></span></li>
       <li class="link" aria-hidden="true"></li>
@@ -156,6 +161,8 @@ INDEX = r'''<!doctype html>
         <span><i class="mk change"></i>a change</span>
         <span><i class="mk problem"></i>a problem starts</span>
         <span><i class="mk cleared"></i>ok again</span>
+        <span><i class="mk traced"></i>auto-trace done</span>
+        <span><i class="joint-key"></i>change → problem link</span>
         <span><i class="gap"></i>not recording</span>
         <span id="changes-note"></span>
       </div>
@@ -395,6 +402,16 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
 .legend .mk.change,.legend .mk.cleared{width:12px;height:12px}
 .legend .mk.problem{border-left-width:7px;border-right-width:7px;border-bottom-width:12px}
 .mk[aria-pressed="true"]{outline:3px solid var(--cyan);outline-offset:3px}
+.joint{position:absolute;top:24px;height:0;border-top:3px solid var(--ok);pointer-events:none}
+.joint.maybe{border-top:3px dashed var(--warn)}
+.joint-key{display:inline-block;width:22px;border-top:3px solid var(--ok)}
+.mk.traced{top:18px;width:12px;height:12px;border-radius:2px;background:#a58bf0;transform:translateX(-50%) rotate(45deg)}
+.legend .mk.traced{transform:rotate(45deg)}
+.linkline{font-size:12.5px;color:var(--ok)}
+.linkline.maybe{color:var(--warn-text)}
+.traceline{font-size:12.5px;color:#c3b2f7}
+.auto-note{display:flex;flex-wrap:wrap;gap:10px;align-items:center;border-color:#7c5cd6;background:#17142a}
+.tag.auto{background:#241c40;color:#c3b2f7}
 .picked{display:flex;flex-wrap:wrap;gap:10px;align-items:center;border-color:var(--blue)}
 
 /* console */
@@ -439,6 +456,11 @@ JS = r'''"use strict";
     return e;
   }
   function clear(e) { while (e.firstChild) e.removeChild(e.firstChild); }
+  // the same words as links.say on the server
+  function linkText(l) {
+    var when = l.gap < 60 ? "at about the same time as" : Math.round(l.gap / 60) + " min after";
+    return (l.strength === "maybe" ? "maybe: " : "") + when + ": " + l.text;
+  }
   function short(text, n) { text = String(text || "").replace(/\s+/g, " ").trim(); return text.length > n ? text.slice(0, n - 1) + "…" : text; }
 
   function api(method, path, body) {
@@ -572,12 +594,13 @@ JS = r'''"use strict";
 
   // ================= Trace =================
   function freshTrace() { trace = { title: "", started: 0, steps: 0, cause: "", fix: "", saved: false }; drawTrail(); }
-  function openChat() {
-    var saved = sessionStorage.getItem("chat");
+  function openChat(id) {
+    var saved = id || sessionStorage.getItem("chat");
     var got = saved ? Promise.resolve({ id: saved }) : api("POST", "/api/chat", {});
     got.then(function (c) {
       chat = c.id; next = 0;
       sessionStorage.setItem("chat", chat);
+      $("trace-auto").hidden = true;
       clear($("talk"));
       turn = null;
       freshTrace();
@@ -593,10 +616,16 @@ JS = r'''"use strict";
       next = data.next;
       setBusy(data.busy);
       if (data.context && $("context").value !== data.context) $("context").value = data.context;
+      $("trace-auto").hidden = !data.auto;
+      if (!data.auto) sessionStorage.setItem("mine", chat);
       if (data.busy) poll();
     }).catch(function (err) {
       polling = false;
-      if (/gone/.test(err.message)) { sessionStorage.removeItem("chat"); openChat(); }
+      if (/gone/.test(err.message)) {
+        sessionStorage.removeItem("chat");
+        if (sessionStorage.getItem("mine") === chat) sessionStorage.removeItem("mine");
+        openChat(sessionStorage.getItem("mine") || undefined);
+      }
       else if (busy) setTimeout(poll, 3000);
     });
   }
@@ -620,7 +649,12 @@ JS = r'''"use strict";
   }
   function handle(e) {
     if (e.t === "ask") {
-      if (!trace.title) { trace.title = e.d; trace.started = e.time || Math.floor(Date.now() / 1000); }
+      if (!trace.title) {
+        var auto = /^Auto-trace\. The watch found a new problem at [0-9:]+ on [^:]+: ([^\n]+)/.exec(e.d);
+        trace.title = auto ? "Auto-trace: " + auto[1] : e.d;
+        trace.by = auto ? "Tracer" : me ? me.user : "";
+        trace.started = e.time || Math.floor(Date.now() / 1000);
+      }
       $("talk").appendChild(el("div", "bubble", e.d));
       newTurn();
       drawTrail();
@@ -675,7 +709,7 @@ JS = r'''"use strict";
   // The model is asked to write "Cause: ..." and "Fix: ..." lines; "not found yet" and "not yet" mean none.
   function said(text, word) {
     var re = new RegExp("^\\s*[*_#\\s]*(likely |root |probable )?" + word + "[*_]*\\s*:[*_]*\\s*(.+)$", "gim"), m, last = "";
-    while ((m = re.exec(text))) last = m[2].replace(/[*_`]/g, "").trim();
+    while ((m = re.exec(text))) last = m[2].replace(/[*`]/g, "").replace(/^_+|_+$/g, "").trim();
     return /^not (found|yet|known|established)/i.test(last) ? "" : last;
   }
   function stage(n, state, detail) {
@@ -694,7 +728,7 @@ JS = r'''"use strict";
     stage(4, trace.saved || trace.fix ? "done" : "", trace.saved ? "saved as a case" : trace.fix ? short(trace.fix, 60) : "not yet");
     $("trace-title").textContent = asked ? short(trace.title, 110) : "New trace";
     $("trace-sub").textContent = asked
-      ? "Started " + clock(trace.started) + " by " + (me ? me.user : "") + " · " + trace.steps + (trace.steps === 1 ? " step" : " steps") + " · this page changes nothing"
+      ? "Started " + clock(trace.started) + " by " + (trace.by || "") + " · " + trace.steps + (trace.steps === 1 ? " step" : " steps") + " · this page changes nothing"
       : "Ask about a problem. Tracer looks, and draws the trail from symptom to fix.";
     $("case-where").textContent = ($("host").value || "any host") + (me && me.kubernetes && $("context").value ? " · " + $("context").value : "");
     $("case-steps").textContent = trace.steps ? trace.steps + " run" : "none yet";
@@ -758,6 +792,16 @@ JS = r'''"use strict";
         if (kept) api("POST", "/api/chat/" + chat + "/save-case", { text: kept }).then(poll).catch(failed);
       });
   }
+  // An auto-trace from the Map, What changed or the Console. Your own trace is kept to come back to.
+  function openTrace(id) {
+    show("trace");
+    if (id !== chat) openChat(id);
+  }
+  $("back-mine").addEventListener("click", function () {
+    var mine = sessionStorage.getItem("mine");
+    if (mine && mine !== chat) { openChat(mine); return; }
+    sessionStorage.removeItem("chat"); openChat();
+  });
   // From the other views: open the trace with a question ready, about the right host.
   function traceThis(question, host) {
     show("trace");
@@ -895,7 +939,21 @@ JS = r'''"use strict";
       var what = el("div", "what");
       what.appendChild(el("div", "", p.text));
       what.appendChild(el("div", "muted small", (p.lane ? p.lane + " · " : "") + (p.known ? "already open when the page started" : "open for " + ago(p.since))));
+      if (p.link) what.appendChild(el("div", "linkline" + (p.link.strength === "maybe" ? " maybe" : ""), "← " + linkText(p.link)));
+      var t = p.trace;
+      if (t) {
+        what.appendChild(el("div", "traceline", {
+          waiting: "Auto-trace waiting for its turn…", running: "Auto-trace running…",
+          done: t.cause ? "Traced, likely: " + short(t.cause, 140) : "Traced: no cause found",
+          limit: "Not traced: " + t.most + " auto-traces already this hour", failed: "Auto-trace failed: " + (t.why || "")
+        }[t.state] || ""));
+      }
       row.appendChild(what);
+      if (t && t.id) {
+        var o = el("button", "primary", t.state === "done" ? "Open trace" : "Watch it"); o.type = "button";
+        o.addEventListener("click", function () { openTrace(t.id); });
+        row.appendChild(o);
+      }
       var b = el("button", "", "Trace this"); b.type = "button";
       b.addEventListener("click", function () { traceThis("Why: " + p.text + "?", p.lane); });
       row.appendChild(b);
@@ -975,10 +1033,17 @@ JS = r'''"use strict";
       grid.appendChild(track);
     });
     river.appendChild(grid);
+    shown.forEach(function (e) {  // a line from the change to the problem it may explain
+      if (e.kind !== "problem" || !e.link || !tracks[e.lane]) return;
+      var a = Math.max(0, where(e.link.time, d)), b = Math.min(100, where(e.time, d));
+      var j = el("span", "joint" + (e.link.strength === "maybe" ? " maybe" : ""));
+      j.style.left = Math.min(a, b) + "%"; j.style.width = Math.max(0.3, Math.abs(b - a)) + "%";
+      tracks[e.lane].appendChild(j);
+    });
     shown.slice().reverse().forEach(function (e) {
       var track = tracks[e.lane] || tracks[lanes[0]];
       var k = key(e);
-      var b = el("button", "mk " + (e.kind === "problem" ? "problem" : e.kind === "cleared" ? "cleared" : e.kind === "cluster" ? "cluster" : "change"));
+      var b = el("button", "mk " + ({ problem: "problem", cleared: "cleared", cluster: "cluster", traced: "traced" }[e.kind] || "change"));
       b.type = "button";
       b.style.left = Math.min(99.5, Math.max(0.5, where(e.time, d))) + "%";
       b.title = clock(e.time) + " " + e.lane + ": " + e.text;
@@ -994,13 +1059,14 @@ JS = r'''"use strict";
       row.type = "button";
       row.setAttribute("aria-pressed", String(!!picked[k]));
       row.appendChild(el("span", "when mono", clock(e.time)));
-      var label = { problem: "problem starts", cleared: "ok again", cluster: "cluster record", change: "change" }[e.kind] || e.kind;
-      row.appendChild(el("span", "tag" + (hot ? " hot" : e.kind === "cleared" ? " good" : ""), label));
+      var label = { problem: "problem starts", cleared: "ok again", cluster: "cluster record", change: "change", traced: "auto-trace" }[e.kind] || e.kind;
+      row.appendChild(el("span", "tag" + (hot ? " hot" : e.kind === "cleared" ? " good" : e.kind === "traced" ? " auto" : ""), label));
       var what = el("span", "what");
       what.appendChild(el("span", "", e.text));
+      if (e.link) { what.appendChild(el("br")); what.appendChild(el("span", "linkline" + (e.link.strength === "maybe" ? " maybe" : ""), "← " + linkText(e.link))); }
       row.appendChild(what);
       row.appendChild(el("span", "muted small", e.lane || ""));
-      row.addEventListener("click", function () { pick(e); });
+      row.addEventListener("click", function () { if (e.kind === "traced" && e.id) openTrace(e.id); else pick(e); });
       list.appendChild(row);
     });
     if (!shown.length) list.appendChild(el("p", "muted", find ? "Nothing in this period matches." : "Nothing changed in this period."));
@@ -1073,8 +1139,9 @@ JS = r'''"use strict";
       var line = el("div");
       line.appendChild(el("span", "muted", clock(e.time) + "  "));
       line.appendChild(el("span", e.kind === "problem" ? "warn" : "", (e.lane || "") + "  "));
-      line.appendChild(el("span", e.kind === "problem" ? "warn" : e.kind === "cleared" ? "okc" : "",
-        (e.kind === "problem" ? "▲ " : e.kind === "cleared" ? "✓ " : "● ") + e.text));
+      line.appendChild(el("span", e.kind === "problem" ? "warn" : e.kind === "cleared" ? "okc" : e.kind === "traced" ? "traceline" : "",
+        ({ problem: "▲ ", cleared: "✓ ", traced: "◆ auto-trace: " }[e.kind] || "● ") + e.text));
+      if (e.link) line.appendChild(el("span", "linkline" + (e.link.strength === "maybe" ? " maybe" : ""), "  ← " + e.link.text));
       f.appendChild(line);
     });
   }

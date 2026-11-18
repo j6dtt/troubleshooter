@@ -1,4 +1,5 @@
 """python -m unittest discover tests  (no network, no Docker needed)"""
+import dataclasses
 import gzip
 import io
 import json
@@ -11,7 +12,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from unittest import mock
 
-from troubleshooter import cases, cli, config, engine, history, hosts, launcher, learn, llm, tools, watch, web, webpage
+from troubleshooter import cases, cli, config, engine, history, hosts, launcher, learn, links, llm, tools, watch, web, webpage
 from troubleshooter.config import Settings
 from troubleshooter.redact import clean, mask, strip_control
 from troubleshooter.run import run
@@ -1675,6 +1676,122 @@ class Page(unittest.TestCase):
             self.assertNotIn(risky, webpage.JS)
         self.assertNotIn(" style=", webpage.INDEX)
         self.assertNotIn("onclick", webpage.INDEX.lower())
+
+
+class Links(unittest.TestCase):
+    def change(self, t, text, lane="host-02", after=None):
+        return {"time": t, "after": t if after is None else after, "lane": lane, "text": text}
+
+    def test_a_change_just_before_on_the_same_thing_is_linked(self):
+        p = {"time": 1000, "lane": "host-02", "text": "host-02 docker: relay: Up 1 minute (unhealthy)"}
+        got = links.find(p, [self.change(940, "container relay: image relay:4 -> relay:5"),
+                             self.change(990, "container cache: image cache:1 -> cache:2")], 10)
+        self.assertEqual((got["strength"], got["gap"]), ("linked", 60))
+        self.assertEqual(links.say(got), "1 min after: container relay: image relay:4 -> relay:5")
+
+    def test_same_host_other_name_is_only_maybe(self):
+        p = {"time": 1000, "lane": "host-03", "text": "host-03 docker: web: Exited (1)"}
+        got = links.find(p, [self.change(880, "container cache: image cache:1 -> cache:2", "host-03")], 10)
+        self.assertEqual(got["strength"], "maybe")
+        self.assertTrue(links.say(got).startswith("maybe: 2 min after"))
+
+    def test_no_link_for_another_lane_too_long_before_after_or_a_restart(self):
+        p = {"time": 2000, "lane": "host-02", "text": "docker: relay: Restarting"}
+        for c in (self.change(1990, "container relay: image a -> b", "host-03"),     # another host
+                  self.change(2000 - 16 * 60, "container relay: image a -> b"),      # 16 min before
+                  self.change(2300, "container relay: image a -> b", after=2100),    # after the problem
+                  self.change(1990, "container relay: started again at 2026-11-17 13:52 UTC"),  # a symptom
+                  self.change(1990, "pod shop/relay-1: restarted 6 times"),
+                  self.change(1990, "new pod shop/relay-2: restarted 3 times"),
+                  self.change(1990, "container relay: state running -> exited; restarted by Docker 2 more times"),
+                  self.change(1990, "deployment shop/relay: ready 3 -> 1")):
+            self.assertIsNone(links.find(p, [c], 10), c["text"])
+
+    def test_a_real_change_counts_even_beside_a_symptom(self):
+        p = {"time": 2000, "lane": "host-02", "text": "docker: relay: Exited (1)"}
+        for text in ("container relay: image a -> b; state running -> exited", "new container relay: image a, exited",
+                     "container relay is gone", "configmap shop/relay-config: its content changed"):
+            self.assertIsNotNone(links.find(p, [self.change(1990, text)], 10), text)
+
+    def test_a_change_seen_only_at_the_next_snapshot_still_counts(self):
+        p = {"time": 1000, "lane": "vks-a", "text": "kubernetes vks-a: pod shop/web-7c9: CrashLoopBackOff"}
+        got = links.find(p, [self.change(1200, "deployment shop/web: image shop/web:1.2 -> shop/web:1.3", "vks-a", after=900)], 10)
+        self.assertEqual((got["strength"], got["gap"]), ("linked", 0))
+        self.assertTrue(links.say(got).startswith("at about the same time as"))
+
+    def test_names_of_each_kind(self):
+        for text, want in (("container relay: image a -> b", "relay"), ("new container extra: image x", "extra"),
+                           ("deployment shop/web: ready 3 -> 1", "shop/web"),
+                           ("VKS machine team-a/prod1-w-2 of cluster prod1: Running -> Provisioning", "team-a/prod1-w-2")):
+            self.assertEqual(links.subject(text), want)
+
+
+class Auto(unittest.TestCase):
+    def setUp(self):
+        base = tempfile.mkdtemp()
+        self.s = Settings(llm_url="http://model", llm_model="m", kube_dir="/none", log_dir=os.path.join(base, "logs"),
+                          runbook_dir=os.path.join(base, "runbooks"), web_users="alice:x", auto_trace_per_hour=2)
+        os.makedirs(self.s.log_dir)
+        self.logged = []
+        with mock.patch.object(web.AutoTrace, "_work", lambda self: None):
+            self.site = web.Site(self.s, self.logged.append)
+        self.here = self.site.health.box.here
+
+    def rounds(self, *found):
+        rounds = [{"problems": p, "lines": []} for p in found]
+        with mock.patch.object(watch, "survey", lambda box: rounds.pop(0)), \
+                mock.patch.object(web.Health, "_hosts", lambda self: []):
+            for _ in found:
+                self.site.health.round()
+
+    def test_a_new_problem_is_linked_and_queued_within_the_hourly_limit(self):
+        now = int(__import__("time").time())
+        changes = [{"time": now - 120, "after": now - 400, "where": "Docker", "text": "container relay: image relay:4 -> relay:5"}]
+        with mock.patch.object(history, "record", lambda box: None), mock.patch.object(history, "events", lambda s, since: changes):
+            self.rounds({"old": "docker: db: Exited"},
+                        {"old": "docker: db: Exited", "a": "docker: relay: unhealthy", "b": "docker: web: Exited",
+                         "c": "docker: cache: Exited"})
+        got = {p["text"]: p for p in self.site.health.state()["problems"]}
+        self.assertIsNone(got["docker: db: Exited"]["trace"])                       # open before the page started
+        self.assertEqual(got["docker: relay: unhealthy"]["link"]["strength"], "linked")
+        self.assertEqual(got["docker: web: Exited"]["link"]["strength"], "maybe")
+        states = sorted(p["trace"]["state"] for t, p in got.items() if t != "docker: db: Exited")
+        self.assertEqual(states, ["limit", "waiting", "waiting"])                   # 2 an hour
+        self.assertEqual(self.site.health.auto.waiting.qsize(), 2)
+        self.assertTrue(any("started 2 min after: container relay" in line for line in self.logged))
+
+    def test_off_means_no_trace_at_all(self):
+        self.site.s = dataclasses.replace(self.site.s, auto_trace=False)
+        with mock.patch.object(history, "record", lambda box: None), mock.patch.object(history, "events", lambda s, since: []):
+            self.rounds({}, {"a": "docker: relay: unhealthy"})
+        self.assertIsNone(self.site.health.state()["problems"][0]["trace"])
+        self.assertEqual(self.site.health.auto.waiting.qsize(), 0)
+
+    def test_the_trace_runs_and_everyone_can_open_it(self):
+        problem = {"text": "docker: relay: unhealthy", "since": 1000, "lane": self.here, "known": False,
+                   "link": {"strength": "linked", "text": "container relay: image relay:4 -> relay:5", "time": 940, "gap": 60}}
+        self.site.health.open["a"] = dict(problem)
+        asked = []
+
+        def ask(chat, question, host):
+            asked.append(question)
+            chat.step("Read logs of container relay")
+            chat.result("connect refused")
+            chat.text("Cause: relay:5 needs DB_URL, which is not set.\nFix: add DB_URL and restart relay.")
+        with mock.patch.object(web.Chat, "ask", ask):
+            self.site.health.auto.run("a", problem)
+        trace = self.site.health.state()["problems"][0]["trace"]
+        self.assertEqual((trace["state"], trace["cause"]), ("done", "relay:5 needs DB_URL, which is not set."))
+        self.assertIn("That change names the same thing: check it first.", asked[0])
+        self.assertIn("1 min after: container relay", asked[0])
+        self.assertIs(self.site.chat("alice", trace["id"]).user, web.AUTO)       # anyone signed in may open it
+        traced = self.site.changes(6)["events"][0]
+        self.assertEqual((traced["kind"], traced["id"]), ("traced", trace["id"]))
+        self.assertTrue(any("Auto-traced docker: relay: unhealthy" in line for line in self.logged))
+
+    def test_cause_line_is_found_and_not_yet_means_none(self):
+        self.assertEqual(web.cause_in("**Cause:** disk full\nFix: clean"), "disk full")
+        self.assertEqual(web.cause_in("Cause: not found yet"), "")
 
 
 class Launcher(unittest.TestCase):

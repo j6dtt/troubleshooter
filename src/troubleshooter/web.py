@@ -12,9 +12,11 @@ they run as the person typing. Everyone signs in with an account from .env (./ts
 """
 import dataclasses
 import hashlib
+import collections
 import hmac
 import json
 import os
+import queue
 import re
 import secrets
 import socket
@@ -23,7 +25,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
-from . import cases, config, history, hosts, llm, watch, webpage
+from . import cases, config, history, hosts, links, llm, watch, webpage
 from .engine import Session
 from .redact import mask, strip_control
 from .tools import NAME, BadInput, Toolbox
@@ -35,6 +37,16 @@ WAIT = 25                 # seconds a request for events waits for news
 HEALTH_EVERY = 60
 EVENTS_KEPT = 2000
 ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+AUTO = "auto-trace"            # the "user" of the traces Tracer starts by itself; everyone may open them
+AUTO_KEPT = 50
+CAUSE = re.compile(r"^\s*[*_#\s]*(?:likely |root |probable )?cause[*_]*\s*:[*_]*\s*(.+)$", re.I | re.M)
+
+
+def cause_in(text):
+    """The model's "Cause:" line, or "" when it found none."""
+    found = [m.strip(" *_`") for m in CAUSE.findall(text or "")]
+    last = found[-1] if found else ""
+    return "" if re.match(r"not (found|yet|known|established)", last, re.I) else last
 
 
 def users(settings):
@@ -145,7 +157,7 @@ class Health:
         self.box = Toolbox(dataclasses.replace(settings, allow_changes=False))
         self.lock = threading.Lock()
         self.open, self.lines, self.checked, self.failed = {}, [], 0, ""
-        self.hosts = []
+        self.hosts, self.auto = [], None
         self.path = os.path.join(settings.log_dir, "watch-events.jsonl")
         self.events = self._load()
 
@@ -200,12 +212,14 @@ class Health:
             return
         now, new = int(time.time()), []
         where = lambda k: watch.lane(k, self.box.here, self.box.agents)
+        added = []
         with self.lock:
             first = not self.checked
             for k, text in seen["problems"].items():
                 if k not in self.open:
                     self.open[k] = {"text": text, "since": now, "known": first, "lane": where(k)}
                     if not first:
+                        added.append(k)
                         new.append({"time": now, "kind": "new", "text": text, "lane": where(k)})
                         self.log(f"The page's watch found a new problem: {text}")
                 else:
@@ -213,9 +227,67 @@ class Health:
             for k in [k for k in self.open if k not in seen["problems"]]:
                 new.append({"time": now, "kind": "ok", "text": self.open.pop(k)["text"], "lane": where(k)})
             self.lines, self.hosts, self.checked, self.failed = seen["lines"], found, now, ""
+            fresh = [(k, dict(self.open[k])) for k in added]
+        if fresh:
+            found_links = self._link(fresh, now)
+            with self.lock:
+                for k, link in found_links.items():
+                    if k in self.open:
+                        self.open[k]["link"] = link
+                for e in new:
+                    e["link"] = next((found_links[k] for k, p in fresh if p["text"] == e["text"] and k in found_links), None)
+                    if e["link"]:
+                        self.log(f"{e['text']} started {links.say(e['link'])}")
+        with self.lock:
             self.events += new
         if new:
             self._keep(new)
+        for k, p in fresh:
+            if self.auto and not k.endswith(" agent"):  # an agent that does not answer can't be traced through it
+                self.mark(k, self.auto.offer(k, {**p, "link": found_links.get(k)}))
+
+    def _link(self, fresh, now):
+        """A fresh snapshot of the lanes with new problems, then each problem's change, if any."""
+        lanes, box = {p["lane"] for _, p in fresh}, self.box
+        since = now - self.s.link_minutes * 60 - 3600
+        changes = []
+        if lanes & {box.here, *box.clusters}:
+            history.record(box)
+            changes += [{**e, "lane": box.here if e["where"] == "Docker" else e["where"]} for e in history.events(self.s, since)]
+        for host in lanes & set(box.agents):
+            try:
+                hosts.ask(self.s, host, "_record", timeout=60)
+                changes += [{**e, "lane": host} for e in json.loads(hosts.ask(self.s, host, "_events", {"since": since}, timeout=30))]
+            except (hosts.Unreachable, ValueError):
+                pass
+        found = {}
+        for k, p in fresh:
+            link = links.find({"time": now, "lane": p["lane"], "text": p["text"]}, changes, self.s.link_minutes)
+            if link:
+                found[k] = link
+            else:
+                mine = [c for c in changes if c["lane"] == p["lane"]]
+                self.log(f"No change on {p['lane']} in the {self.s.link_minutes} min before {p['text']} "
+                         f"({len(mine)} recorded change(s) there in the last hour, the newest at "
+                         f"{time.strftime('%H:%M:%S', time.localtime(max((c['time'] for c in mine), default=0)))})")
+        return found
+
+    def mark(self, k, trace):
+        """Where the problem's auto-trace stands: waiting, running, done, limit or failed."""
+        if trace is None:
+            return
+        with self.lock:
+            if k in self.open:
+                self.open[k]["trace"] = trace
+
+    def still_open(self, k):
+        with self.lock:
+            return k in self.open
+
+    def note(self, event):
+        with self.lock:
+            self.events.append(event)
+        self._keep([event])
 
     def forever(self):
         while True:
@@ -225,7 +297,8 @@ class Health:
     def state(self):
         with self.lock:
             return {"checked": self.checked, "every": HEALTH_EVERY, "failed": self.failed,
-                    "problems": sorted(({"text": p["text"], "since": p["since"], "known": p["known"], "lane": p["lane"]}
+                    "problems": sorted(({"text": p["text"], "since": p["since"], "known": p["known"], "lane": p["lane"],
+                                         "link": p.get("link"), "trace": p.get("trace")}
                                         for p in self.open.values()), key=lambda p: -p["since"]),
                     "lines": self.lines, "hosts": self.hosts, "events": self.events[-60:][::-1],
                     "clusters": [{"name": c["where"], "kind": c["kind"], "line": c["line"], "problems": c["problems"]}
@@ -234,6 +307,73 @@ class Health:
     def problem_events(self, since):
         with self.lock:
             return [e for e in self.events if e["time"] >= since]
+
+
+class AutoTrace:
+    """A new problem starts its own look-only trace: one at a time, at most auto-trace-per-hour an hour."""
+
+    def __init__(self, site):
+        self.site, self.started, self.waiting = site, [], queue.Queue()
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def offer(self, k, problem):
+        """Called for each new problem. What to show for it now, or None when auto-trace is off."""
+        s = self.site.s
+        if not s.auto_trace or s.auto_trace_per_hour <= 0 or not s.llm_url:
+            return None
+        now = time.time()
+        self.started = [t for t in self.started if now - t < 3600]
+        if len(self.started) >= s.auto_trace_per_hour:
+            self.site.log(f"Did not auto-trace {problem['text']}: {s.auto_trace_per_hour} were already started this hour")
+            return {"state": "limit", "most": s.auto_trace_per_hour}
+        self.started.append(now)
+        self.waiting.put((k, problem))
+        return {"state": "waiting"}
+
+    def _work(self):
+        while True:
+            k, problem = self.waiting.get()
+            health = self.site.health
+            if not health.still_open(k):
+                continue  # it cleared before its turn
+            try:
+                self.run(k, problem)
+            except Exception as e:  # one failed trace must not stop the next
+                health.mark(k, {"state": "failed", "why": str(e)[:200]})
+                self.site.log(f"The auto-trace of {problem['text']} failed: {e}")
+
+    def question(self, problem):
+        link = problem.get("link")
+        text = [f"Auto-trace. The watch found a new problem at {time.strftime('%H:%M', time.localtime(problem['since']))} "
+                f"on {problem['lane']}: {problem['text']}"]
+        if link and link["strength"] == "linked":
+            text.append(f"It started {links.say(link)}. That change names the same thing: check it first.")
+        elif link:
+            text.append(f"It started {links.say(link)[7:]}. That change is on the same host but names something else: "
+                        "check it, don't assume it is the cause.")
+        text.append("Find the likely cause. Look only: what changed on that host or cluster, the logs and state of the "
+                    "thing, and past cases. Use at most 6 tool calls. End with a Cause: line and a Fix: line.")
+        return "\n".join(text)
+
+    def run(self, k, problem):
+        site, health = self.site, self.site.health
+        settings = config.for_learning(site.s)  # the learn model when one is set, so people keep the chat model
+        chat = Chat(secrets.token_urlsafe(12), AUTO, settings, site.log)
+        site.keep_auto(chat)
+        health.mark(k, {"state": "running", "id": chat.id})
+        host = problem["lane"] if problem["lane"] in chat.session.box.agents else ""
+        if problem["lane"] in chat.session.box.clusters:
+            chat.session.use_context(problem["lane"])
+        chat.run(lambda: chat.ask(self.question(problem), host))
+        with chat.cond:
+            while chat.busy:
+                chat.cond.wait(10)
+        cause = cause_in("".join(e.get("d", "") for e in chat.events if e["t"] == "text"))
+        health.mark(k, {"state": "done", "id": chat.id, "cause": cause})
+        health.note({"time": int(time.time()), "kind": "traced", "lane": problem["lane"], "id": chat.id,
+                     "text": f"{problem['text']}: {('likely ' + cause) if cause else 'no cause found'}"})
+        site.log(f"Auto-traced {problem['text']} on {problem['lane']}: "
+                 f"{('likely cause: ' + cause) if cause else 'no cause found'}")
 
 
 class Site:
@@ -249,6 +389,8 @@ class Site:
         self.sessions, self.chats, self.fails = {}, {}, {}
         self.lock = threading.Lock()
         self.health = Health(settings, log)
+        self.auto = collections.OrderedDict()
+        self.health.auto = AutoTrace(self)
         self._kube = (0, [])
 
     # --- signing in ---
@@ -286,8 +428,8 @@ class Site:
     def chat(self, user, cid=None):
         """The user's chat with that id, or a new one."""
         with self.lock:
-            found = self.chats.get(cid or "")
-            if found and found.user == user:
+            found = self.chats.get(cid or "") or self.auto.get(cid or "")
+            if found and found.user in (user, AUTO):
                 found.used = time.time()
                 return found
             if cid:
@@ -301,6 +443,12 @@ class Site:
         with self.lock:
             self.chats[made.id] = made
         return made
+
+    def keep_auto(self, chat):
+        with self.lock:
+            self.auto[chat.id] = chat
+            while len(self.auto) > AUTO_KEPT:
+                self.auto.popitem(last=False)
 
     # --- the timeline ---
     def changes(self, hours):
@@ -336,7 +484,8 @@ class Site:
                 self._kube = (now, [row for rows in pool.map(own, list(box.clusters)) for row in rows])
         found += [e for e in self._kube[1] if e["time"] >= since]
         found += [{"time": e["time"], "where": e.get("lane", ""), "lane": e.get("lane", box.here), "text": e["text"],
-                   "kind": "problem" if e["kind"] == "new" else "cleared"} for e in self.health.problem_events(since)]
+                   "kind": {"new": "problem", "traced": "traced"}.get(e["kind"], "cleared"), "link": e.get("link"),
+                   "id": e.get("id")} for e in self.health.problem_events(since)]
         found.sort(key=lambda e: -e["time"])
         return {"since": since, "now": now, "events": found[:800], "lanes": [box.here, *box.agents, *box.clusters],
                 "coverage": coverage}
@@ -482,7 +631,7 @@ def _handler(site):
                     after = max(0, int(query.get("after", "0")))
                     rows, busy = chat.since(after)
                     return self._send(200, {"events": rows, "next": after + len(rows), "busy": busy,
-                                            "context": chat.session.box.active})
+                                            "context": chat.session.box.active, "auto": chat.user == AUTO})
                 if parts[2] == "step" and len(parts) == 4:
                     text = chat.outputs.get(int(parts[3]))
                     return self._send(200, {"text": text if text is not None else "This step returned nothing to show."})

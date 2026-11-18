@@ -467,9 +467,13 @@ def events(settings, since):
                 if len(_MEMO) > 5000:
                     _MEMO.pop(next(iter(_MEMO)))
             where = ""
+            try:  # the old state was last seen then: the change happened after it
+                after = min(int(os.path.getmtime(os.path.join(folder(settings), last))), _taken(name))
+            except OSError:
+                after = _taken(last)
             for row in _MEMO[pair]:
                 if row.startswith("- "):
-                    found.append({"time": _taken(name), "where": where, "text": row[2:]})
+                    found.append({"time": _taken(name), "after": after, "where": where, "text": row[2:]})
                 else:
                     where = "Docker" if row == "DOCKER" else row.replace("KUBERNETES ", "")
         last = name

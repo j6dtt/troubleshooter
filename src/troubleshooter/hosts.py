@@ -167,6 +167,9 @@ class Agent:
             return True, json.dumps(watch.local_problems(self.box))
         if tool == "_survey":
             return True, json.dumps(watch.local_survey(self.box))
+        if tool == "_record":  # the hub found a new problem here: write the state down now, so the change shows
+            history.record(self.box)
+            return True, "recorded"
         if tool == "_map":
             return True, json.dumps(watch.local_map(self.box))
         if tool == "_events":

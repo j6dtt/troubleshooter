@@ -263,6 +263,26 @@ The page looks only: it never changes anything. Fixes stay in ./ts.
 "Trace this" on the Map, and "Trace these" in What changed, open
 the Trace with the question written and the host chosen.
 
+AUTO-TRACE AND CHANGE LINKS (on the hub)
+
+When the watch finds a new problem, the hub writes down the state
+at once and looks for a change just before it on the same host or
+cluster (link-minutes, default 10):
+
+  linked   the change names the same container or workload
+  maybe    same host, other name: worth a look, not a cause
+
+A restart, a state flip or fewer ready is never a cause: that is
+what the problem looks like. The link shows on the Map, in What
+changed (a line between the two) and in the Console.
+
+Then Tracer traces the problem itself, look-only: what changed,
+logs and state, past cases, then Cause: and Fix:. It uses the
+learn model when one is set. The Map shows "Traced, likely: ..."
+with Open trace; everyone signed in can read it and ask more.
+At most auto-trace-per-hour (default 10); auto-trace "off" stops it.
+Problems already open when the page starts are not traced.
+
 A case saved, edited or deleted on the page counts on the hub at
 once. The other hosts see it after ./ts next runs on the hub.
 

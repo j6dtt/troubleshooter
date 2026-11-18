@@ -42,6 +42,9 @@ class Settings:
     learn_llm_api_key: str = field(default="", repr=False)
     record_minutes: int = 5
     kubernetes: bool = True
+    auto_trace: bool = True
+    auto_trace_per_hour: int = 10
+    link_minutes: int = 10
     hub_host: str = ""            # "name" or "name=address"; empty = this host stands alone
     agent_hosts: tuple = ()       # each "name" or "name=address"
     agent_port: int = 8001
@@ -84,6 +87,9 @@ def load():
         learn_llm_api_key=os.environ.get("LEARN_LLM_API_KEY", ""),
         record_minutes=int(os.environ.get("RECORD_MINUTES", "5") or 0),
         kubernetes=_flag("KUBERNETES", "on"),
+        auto_trace=_flag("AUTO_TRACE", "on"),
+        auto_trace_per_hour=int(os.environ.get("AUTO_TRACE_PER_HOUR", "10") or 0),
+        link_minutes=int(os.environ.get("LINK_MINUTES", "10") or 10),
         hub_host=os.environ.get("HUB_HOST", "").strip(),
         agent_hosts=tuple(_list("AGENT_HOSTS")),
         agent_port=int(os.environ.get("AGENT_PORT", "8001") or 8001),

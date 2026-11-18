@@ -63,9 +63,11 @@ One web page for everything, same code on every host.
 - [x] `./ts setup` (keys and certificate) and `./ts user` (accounts).
 - [x] The page, with sign-in, on tcp/9001. It looks only.
 - [x] `./ts setup --web-cert`: your own certificate for the page.
-- [x] A. Chat, with each step's full output beside it.
-- [x] C. Health: open problems first, then everything watched.
-- [x] B. What changed, as a timeline.
+- [x] A. Trace (was Chat): the trail from symptom to fix, with each
+  step's output as an evidence card.
+- [x] C. Map (was Health): every host's containers and every cluster.
+- [x] B. What changed: one lane per host and cluster.
+- [x] Console: a status wall for a big screen.
 - [x] D. Library: cases, runbooks and reports; cases can be edited
       and deleted.
 
@@ -88,6 +90,16 @@ Ideas for later:
 - [x] Fix tools refuse a Supervisor context.
 - [x] Background recorder: Docker snapshots with no chat open.
 - [x] Snapshots compressed, folder capped at 50 MB.
+
+## Phase 5: Tracer works by itself
+
+- [x] 17. Change -> problem links: a change just before a problem on
+  the same host or cluster is linked to it (no model).
+- [x] 18. Auto-trace: a new problem starts its own look-only trace,
+  at most 10 an hour, with the learn model when one is set.
+- [ ] 19. Hand-off to ./ts: open a page trace in the terminal to fix it.
+- [ ] 20. Alerts out (mail relay, chat or syslog), once per problem.
+- [ ] 21. Shared traces: who is looking at what.
 
 ## Housekeeping
 
