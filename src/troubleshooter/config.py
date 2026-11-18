@@ -45,6 +45,8 @@ class Settings:
     auto_trace: bool = True
     auto_trace_per_hour: int = 10
     link_minutes: int = 10
+    anonymize: bool = False       # swap host names, IPs and anonymize-words before the model sees them
+    anonymize_words: str = ""     # more words to hide, comma separated: a company name, a domain
     hub_host: str = ""            # "name" or "name=address"; empty = this host stands alone
     agent_hosts: tuple = ()       # each "name" or "name=address"
     agent_port: int = 8001
@@ -90,6 +92,8 @@ def load():
         auto_trace=_flag("AUTO_TRACE", "on"),
         auto_trace_per_hour=int(os.environ.get("AUTO_TRACE_PER_HOUR", "10") or 0),
         link_minutes=int(os.environ.get("LINK_MINUTES", "10") or 10),
+        anonymize=_flag("ANONYMIZE", "off"),
+        anonymize_words=os.environ.get("ANONYMIZE_WORDS", ""),
         hub_host=os.environ.get("HUB_HOST", "").strip(),
         agent_hosts=tuple(_list("AGENT_HOSTS")),
         agent_port=int(os.environ.get("AGENT_PORT", "8001") or 8001),

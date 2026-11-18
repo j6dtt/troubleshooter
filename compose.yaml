@@ -29,6 +29,13 @@ x-settings:
   # With "true" and a private CA: put the CA in ./certs,
   # then e.g. /certs/ca.pem. Empty = the usual public CAs.
   llm-ca-file: &llm-ca-file ""
+  # "on" = the model never sees host names, cluster names or IPs:
+  # they become hostA, clusterA, 198.18.x.x and are swapped back in
+  # its answers. Use it with a model outside your network.
+  anonymize: &anonymize "on"
+  # More words to hide the same way, comma list: a company name,
+  # a domain. This host's own DNS domain is hidden already.
+  anonymize-words: &anonymize-words ""
 
   # --- What it may touch ---
   # false = look only: the fix tools disappear.
@@ -76,8 +83,10 @@ x-settings:
   # Port the agents listen on, and the page's own port (https).
   agent-port: &agent-port "8001"
   web-port: &web-port "9001"
-  # Auto-trace (hub only): a new problem starts its own look-only
-  # trace, with the learn model when one is set. "off" turns it off.
+  # Auto-trace (a hub, or a host alone): a new problem starts its
+  # own look-only trace, with the learn model when one is set.
+  # Saved in logs/traces/; read on the page or with ./ts /traces.
+  # "off" turns it off.
   auto-trace: &auto-trace "on"
   # Most auto-traces started in an hour.
   auto-trace-per-hour: &auto-trace-per-hour "10"
@@ -158,6 +167,8 @@ services:
       AUTO_TRACE: *auto-trace
       AUTO_TRACE_PER_HOUR: *auto-trace-per-hour
       LINK_MINUTES: *link-minutes
+      ANONYMIZE: *anonymize
+      ANONYMIZE_WORDS: *anonymize-words
     # Records in the background. If that ever stops, the container
     # stays up so ./ts keeps working.
     command: ["sh", "-c", "ts record; exec sleep infinity"]

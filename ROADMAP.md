@@ -97,7 +97,12 @@ Ideas for later:
   the same host or cluster is linked to it (no model).
 - [x] 18. Auto-trace: a new problem starts its own look-only trace,
   at most 10 an hour, with the learn model when one is set.
-- [ ] 19. Hand-off to ./ts: open a page trace in the terminal to fix it.
+- [x] 19. Hand-off to ./ts: `/traces N` opens an auto-trace as the chat,
+  with the fix tools.
+- [x] Auto-trace runs in the container's background (hub or alone), and
+  each trace is saved in logs/traces/<host>/.
+- [x] Anonymize: host names, cluster names, IPs and chosen words are
+  swapped for stand-ins before the model sees them.
 - [ ] 20. Alerts out (mail relay, chat or syslog), once per problem.
 - [ ] 21. Shared traces: who is looking at what.
 

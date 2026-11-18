@@ -6,13 +6,15 @@ import json
 import os
 import ssl
 import tempfile
+import contextlib
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from unittest import mock
 
-from troubleshooter import cases, cli, config, engine, history, hosts, launcher, learn, links, llm, tools, watch, web, webpage
+from troubleshooter import anonymize, autotrace, cases, cli, config, engine, history, hosts, launcher, learn, links, llm, tools, watch, web, webpage
 from troubleshooter.config import Settings
 from troubleshooter.redact import clean, mask, strip_control
 from troubleshooter.run import run
@@ -1761,7 +1763,7 @@ class Auto(unittest.TestCase):
         self.assertTrue(any("started 2 min after: container relay" in line for line in self.logged))
 
     def test_off_means_no_trace_at_all(self):
-        self.site.s = dataclasses.replace(self.site.s, auto_trace=False)
+        self.site.health.auto.s = dataclasses.replace(self.site.health.auto.s, auto_trace=False)
         with mock.patch.object(history, "record", lambda box: None), mock.patch.object(history, "events", lambda s, since: []):
             self.rounds({}, {"a": "docker: relay: unhealthy"})
         self.assertIsNone(self.site.health.state()["problems"][0]["trace"])
@@ -1789,9 +1791,138 @@ class Auto(unittest.TestCase):
         self.assertEqual((traced["kind"], traced["id"]), ("traced", trace["id"]))
         self.assertTrue(any("Auto-traced docker: relay: unhealthy" in line for line in self.logged))
 
+    def test_a_trace_is_saved_and_read_back_after_a_restart(self):
+        problem = {"text": "docker: relay: unhealthy", "since": 1000, "lane": self.here, "known": False, "link": None}
+        self.site.health.open["a"] = dict(problem)
+
+        def ask(chat, question, host):
+            chat.add("ask", d=question)
+            chat.step("Read logs of container relay")
+            chat.result("connect refused")
+            chat.text("Cause: DB_URL is not set.\nFix: set DB_URL.")
+            chat.session.messages.append({"role": "assistant", "content": "Cause: DB_URL is not set."})
+        with mock.patch.object(web.Chat, "ask", ask):
+            self.site.health.auto.run("a", problem)
+        cid = self.site.health.state()["problems"][0]["trace"]["id"]
+        files = os.listdir(os.path.join(self.s.log_dir, "traces", self.here))
+        self.assertEqual(len(files), 1)
+        listed = autotrace.listing(self.s)[0]
+        self.assertEqual((listed["id"], listed["state"], listed["cause"], listed["fix"]),
+                         (cid, "done", "DB_URL is not set.", "set DB_URL."))
+        with mock.patch.object(web.AutoTrace, "_work", lambda self: None):
+            later = web.Site(self.s, self.logged.append)            # a restart: nothing in memory
+        chat = later.chat("bob", cid)
+        self.assertEqual(chat.outputs[1], "connect refused")
+        self.assertEqual(chat.session.messages[-1]["content"], "Cause: DB_URL is not set.")
+        self.assertIsNone(later.chat("bob", "x" * 16))
+
+    def test_the_traces_folder_is_capped(self):
+        where = autotrace.folder(self.s, "h1")
+        os.makedirs(where)
+        for n in range(autotrace.TRACES_KEPT + 5):
+            with open(os.path.join(where, f"2026{n:06d}-id{n:06d}.json"), "w") as f:
+                f.write('{"id": "x"}')
+        autotrace._tidy(where)
+        left = sorted(os.listdir(where))
+        self.assertEqual(len(left), autotrace.TRACES_KEPT)
+        self.assertEqual(left[0], "2026000005-id000005.json")    # the oldest went
+
+    def test_alone_runs_the_watch_only_with_a_model_and_auto_trace_on(self):
+        started = []
+        with mock.patch.object(threading, "Thread", lambda target, args=(), daemon=None: mock.Mock(start=lambda: started.append(args[0]))), \
+                mock.patch.object(threading, "Event", lambda: mock.Mock(wait=lambda: None)), \
+                mock.patch.object(autotrace, "start", lambda s, log, mapping: mock.Mock()), \
+                mock.patch("builtins.print"):
+            cli.background(self.s)
+            self.assertEqual(started, ["The recorder", "The watch"])
+            started.clear()
+            cli.background(dataclasses.replace(self.s, auto_trace=False))
+            self.assertEqual(started, ["The recorder"])
+
     def test_cause_line_is_found_and_not_yet_means_none(self):
         self.assertEqual(web.cause_in("**Cause:** disk full\nFix: clean"), "disk full")
         self.assertEqual(web.cause_in("Cause: not found yet"), "")
+
+
+class Anonymize(unittest.TestCase):
+    def setUp(self):
+        self.t = anonymize.Table()
+        self.t.known(["web-prod-07", "dbhost"], "host")
+        self.t.known(["admin@prod-cluster"], "cluster")
+        self.t.known(["acme", "lab.example.org"], "name")
+
+    def test_names_and_addresses_go_and_come_back(self):
+        text = ("web-prod-07 cannot reach dbhost.lab.example.org at 10.20.1.5:5432 or 10.20.1.9; "
+                "context admin@prod-cluster; ACME relay; localhost 127.0.0.1; mask 255.255.255.0")
+        hidden = self.t.hide(text)
+        for real in ("web-prod-07", "dbhost", "lab.example.org", "10.20.1", "prod-cluster", "ACME"):
+            self.assertNotIn(real, hidden)
+        self.assertIn("hostA cannot reach hostB.corpA.example at 198.18.0.5:5432 or 198.18.0.9", hidden)  # same /24
+        self.assertIn("127.0.0.1", hidden)
+        self.assertIn("255.255.255.0", hidden)
+        self.assertEqual(self.t.show(hidden), text.replace("ACME", "acme"))
+
+    def test_other_subnets_and_versions(self):
+        hidden = self.t.hide("10.20.2.5 and 172.16.0.1 run relay 1.2.3 and 4.5.6.7.8")
+        self.assertEqual(hidden, "198.18.0.5 and 198.18.1.1 run relay 1.2.3 and 4.5.6.7.8")
+        self.assertEqual(self.t.show("hostA and 198.18.9.9 and hostZ"), "web-prod-07 and 198.18.9.9 and hostZ")
+
+    def test_the_model_sees_stand_ins_and_the_answer_has_real_names(self):
+        sent, shown = [], []
+        s = Settings(llm_url="http://model", llm_model="m", anonymize=True, anonymize_words="acme", hub_host="")
+
+        def once(settings, body, on_text):
+            sent.append(json.dumps(body))
+            for piece in ("Restart con", "tainer relay on ho", "stA (198.18", ".0.5)."):
+                on_text(piece)
+            return {"role": "assistant", "content": "Restart container relay on hostA (198.18.0.5).",
+                    "tool_calls": [{"id": "1", "type": "function",
+                                    "function": {"name": "docker_logs", "arguments": '{"host": "hostA"}'}}]}, "stop"
+        with mock.patch.object(anonymize, "TABLE", self.t), mock.patch.object(llm, "_once", once), \
+                mock.patch.object(config, "here", lambda: "web-prod-07"):
+            msg, _ = llm.chat(s, [{"role": "system", "content": "You are Tracer on web-prod-07."},
+                                  {"role": "tool", "content": "acme relay at 10.20.1.5"}],
+                              [{"type": "function", "function": {"name": "x", "description": "on web-prod-07"}}], shown.append)
+        self.assertNotIn("web-prod-07", sent[0])
+        self.assertNotIn("10.20.1.5", sent[0])
+        self.assertNotIn("acme", sent[0])
+        self.assertIn("stand for real ones", sent[0])
+        self.assertEqual(msg["content"], "Restart container relay on web-prod-07 (10.20.1.5).")
+        self.assertEqual(json.loads(msg["tool_calls"][0]["function"]["arguments"]), {"host": "web-prod-07"})
+        self.assertEqual("".join(shown), "Restart container relay on web-prod-07 (10.20.1.5).")
+
+    def test_off_sends_everything_as_it_is(self):
+        sent = []
+        with mock.patch.object(llm, "_once", lambda s, body, on_text: (sent.append(json.dumps(body)), ({"content": "ok"}, "stop"))[1]):
+            llm.chat(Settings(llm_url="http://m", llm_model="m"), [{"role": "user", "content": "10.20.1.5"}])
+        self.assertIn("10.20.1.5", sent[0])
+
+
+class Traces(unittest.TestCase):
+    def test_list_and_open_a_trace_in_the_terminal(self):
+        base = tempfile.mkdtemp()
+        s = Settings(llm_url="http://m", llm_model="m", kube_dir="/none", log_dir=base, runbook_dir=base)
+        chat = mock.Mock(events=[{"t": "step", "n": 1, "d": "Read logs of container relay"},
+                                 {"t": "text", "d": "Cause: DB_URL is not set.\nFix: set DB_URL."}],
+                         outputs={1: "connect refused"}, steps=1,
+                         record={"id": "abcdefgh123", "host": "h1", "lane": "h1", "problem": "docker: relay: Exited (1)",
+                                 "since": 100, "started": 1000, "state": "done", "cause": "DB_URL is not set.",
+                                 "link": {"strength": "linked", "text": "container relay: image a -> b", "time": 90, "gap": 10}})
+        chat.session.messages = [{"role": "system", "content": "old"}, {"role": "user", "content": "Auto-trace."},
+                                 {"role": "assistant", "content": "Cause: DB_URL is not set."}]
+        chat.session.box.active = None
+        autotrace.save(s, chat)
+        session = mock.Mock(messages=[{"role": "system", "content": "new"}])
+        session.box.clusters, session.box.agents = {}, []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.traces(s, session, [], lambda line: None)
+            cli.traces(s, session, ["1"], lambda line: None)
+        said = out.getvalue()
+        self.assertIn("docker: relay: Exited (1)", said)
+        self.assertIn("likely: DB_URL is not set.", said)
+        self.assertIn("1. Read logs of container relay", said)
+        self.assertEqual([m["content"] for m in session.messages], ["new", "Auto-trace.", "Cause: DB_URL is not set."])
 
 
 class Launcher(unittest.TestCase):

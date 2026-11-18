@@ -27,6 +27,8 @@ IN THE CHAT
   /paste                   paste many lines; finish with /end
   /report                  write this chat up as an incident report
   /case                    save this problem and its fix for later
+  /traces                  the traces Tracer started by itself
+  /traces N                open trace N here: read, ask more, fix
   /tools                   list every tool
   /new                     forget this conversation
   /help                    short list of these
@@ -263,25 +265,50 @@ The page looks only: it never changes anything. Fixes stay in ./ts.
 "Trace this" on the Map, and "Trace these" in What changed, open
 the Trace with the question written and the host chosen.
 
-AUTO-TRACE AND CHANGE LINKS (on the hub)
+AUTO-TRACE AND CHANGE LINKS
 
-When the watch finds a new problem, the hub writes down the state
-at once and looks for a change just before it on the same host or
+The container watches by itself, every 60 seconds: a hub for every
+host and cluster, a host that stands alone for itself (an agent
+leaves it to its hub). No ./ts or ssh session has to stay open.
+
+When the watch finds a new problem, it writes the state down at
+once and looks for a change just before it on the same host or
 cluster (link-minutes, default 10):
 
   linked   the change names the same container or workload
   maybe    same host, other name: worth a look, not a cause
 
 A restart, a state flip or fewer ready is never a cause: that is
-what the problem looks like. The link shows on the Map, in What
-changed (a line between the two) and in the Console.
+what the problem looks like.
 
 Then Tracer traces the problem itself, look-only: what changed,
 logs and state, past cases, then Cause: and Fix:. It uses the
-learn model when one is set. The Map shows "Traced, likely: ..."
-with Open trace; everyone signed in can read it and ask more.
-At most auto-trace-per-hour (default 10); auto-trace "off" stops it.
-Problems already open when the page starts are not traced.
+learn model when one is set. At most auto-trace-per-hour (default
+10); auto-trace "off" stops it. Problems already open when the
+container starts are not traced.
+
+Each trace is saved in logs/traces/<host>/ (the newest 200, at
+most 20 MB a host), so a restart keeps them. Read them:
+
+  ./ts, then /traces       the list, with link and likely cause
+  /traces 3                open trace 3 as this chat: ask more,
+                           or ask to fix it (fixes ask you first)
+  the page (hub)           Map: Open trace; What changed: the
+                           change -> problem line; Console
+
+ANONYMIZE
+
+With anonymize "on", the model never sees host names, cluster
+names, IP addresses or anonymize-words:
+
+  web-prod-07  -> hostA        prod-cluster -> clusterA
+  site.lan      -> corpA.example
+  10.20.1.5    -> 198.18.0.5   (same subnet, same stand-in subnet)
+
+Its answers and tool calls come back with the real names, so you
+never see the stand-ins. Container, pod and image names are kept:
+the model needs them. Secrets are masked either way. ./ts check
+shows what is hidden. Use it with a model outside your network.
 
 A case saved, edited or deleted on the page counts on the hub at
 once. The other hosts see it after ./ts next runs on the hub.
@@ -365,6 +392,9 @@ docker compose up -d. Secrets go in .env.
   learn-minutes        most time ./ts learn takes per app
   learn-llm-url        another model server for ./ts learn; empty
   learn-llm-model      = same as the chat. ./ts check tests it.
+  anonymize            on = hide host names and IPs from the model
+  anonymize-words      more words to hide, comma list
+  auto-trace           on/off; auto-trace-per-hour, link-minutes
   record-minutes       background snapshots of Docker, with no
                        chat open; 0 = off
   kubernetes           off = Docker and host only

@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 
-from . import __version__, cases, config, history, hosts, learn, llm, watch
+from . import __version__, cases, config, history, hosts, learn, links, llm, watch
 from .engine import Session
 from .redact import strip_control
 from .run import run
@@ -23,6 +23,8 @@ Follow-up questions keep the conversation going.
   /paste          paste many lines, such as command output
   /report         write this conversation up as an incident report
   /case           save this problem and its fix for later chats
+  /traces         the traces Tracer started by itself
+  /traces N       open trace N here: read it, ask more, fix it
   /new    forget this conversation, start again
   /tools  list what I can look at and change
   /help   this list
@@ -50,10 +52,11 @@ def intro(settings, box):
     where = {"hub": f"hub, {len(box.agents)} other host(s)", "agent": f"agent of {config.short(settings.hub_host)}",
              "alone": "on its own"}[kind]
     clusters = f"{len(box.clusters)} context(s)" if box.clusters else ("off" if not settings.kubernetes else "no login")
-    facts = [("host", f"{box.here} ({where})"), ("model", settings.llm_model), ("kubernetes", clusters)]
+    facts = [("host", f"{box.here} ({where})"),
+             ("model", settings.llm_model + ("  (anonymized)" if settings.anonymize else "")), ("kubernetes", clusters)]
     fancy = TTY and shutil.get_terminal_size((80, 24)).columns >= 52 and "UTF" in (sys.stdout.encoding or "").upper()
     if not fancy:
-        print(f"Tracer {__version__}  host {box.here}  model {settings.llm_model}")
+        print(f"Tracer {__version__}  host {box.here}  model {settings.llm_model}" + ("  (anonymized)" if settings.anonymize else ""))
         return
     print()
     for shade, line in zip(SHADES, LOGO.splitlines()):
@@ -204,11 +207,64 @@ def chat(settings):
             report(settings, session, ui)
         elif question == "/case":
             case(settings, session, ui, log)
+        elif question == "/traces" or question.startswith("/traces "):
+            traces(settings, session, question.split()[1:], log)
         else:
             ui.spinner.start()
             session.ask(question)
             ui.done()
             print()
+
+
+def traces(settings, session, words, log):
+    """The auto-traces in the shared folder; one opened here goes on as this chat, with the fix tools."""
+    from . import autotrace
+    found = autotrace.listing(settings, 20)
+    if not found:
+        print("No auto-traces yet. They start when the watch finds a new problem\n"
+              "(on a hub, or a host that stands alone, with auto-trace on).")
+        return
+    if not words:
+        for n, t in enumerate(found, 1):
+            when = time.strftime("%m-%d %H:%M", time.localtime(t.get("started") or 0))
+            state = {"done": "", "running": "  (running)"}.get(t.get("state"), f"  ({t.get('state')})")
+            print(paint("36", f"{n:>2}") + f"  {when}  {t.get('lane')}{state}")
+            print(f"    {short(t.get('problem') or '', 70)}")
+            if t.get("link"):
+                print(paint("32", f"    <- {short(links.say(t['link']), 70)}"))
+            if t.get("state") == "done":
+                print(paint("2", f"    likely: {short(t.get('cause') or 'no cause found', 70)}"))
+        print(paint("2", "Open one with /traces N."))
+        return
+    if not words[0].isdigit() or not 1 <= int(words[0]) <= len(found):
+        print(f"Give a number from 1 to {len(found)}.")
+        return
+    record = autotrace.load(settings, found[int(words[0]) - 1]["id"])
+    if not record:
+        print("That trace is gone.")
+        return
+    print(paint("1", record.get("problem", "")))
+    if record.get("link"):
+        print(paint("32", f"<- {links.say(record['link'])}"))
+    for e in record.get("events") or []:
+        if e.get("t") == "step":
+            print(paint("2", f"  {e.get('n')}. {e.get('d')}"))
+    said = "".join(e.get("d", "") for e in record.get("events") or [] if e.get("t") == "text").strip()
+    print("\n" + (said or "(no answer was written)") + "\n")
+    session.reset()
+    session.messages = [session.messages[0]] + [m for m in record.get("messages") or [] if m.get("role") != "system"]
+    lane = record.get("lane")
+    if lane in session.box.clusters:
+        print(session.use_context(lane))
+    elif lane in session.box.agents:
+        session.note = f"(The operator is asking about the host {lane}.)\n"
+    log(f"You opened the auto-trace of {record.get('problem')}")
+    print(paint("2", "This trace is now this chat: ask more, or ask to fix it (fixes ask you first). /new to leave it."))
+
+
+def short(text, most):
+    text = " ".join(str(text).split())
+    return text if len(text) <= most else text[:most - 1] + "…"
 
 
 def paste():
@@ -272,9 +328,18 @@ def background(settings):
     jobs = [("The recorder", lambda: history.record_forever(box, settings.record_minutes))]
     if kind == "agent":
         jobs.append(("The agent", lambda: hosts.serve_agent(settings, log)))
+    health = None
+    # The watch and auto-trace: on a hub for every host, alone for itself. An agent leaves them to its hub.
+    if kind == "hub" or (kind == "alone" and settings.auto_trace and settings.llm_url):
+        from . import autotrace
+        health = autotrace.start(settings, log, mapping=kind == "hub")
+        jobs.append(("The watch", health.forever))
+        print(f"Watching every {autotrace.HEALTH_EVERY} s. "
+              + (f"Auto-trace is on (at most {settings.auto_trace_per_hour} an hour), saved in logs/traces/."
+                 if settings.auto_trace and settings.llm_url else "Auto-trace is off."), flush=True)
     if kind == "hub":
         from . import web  # only the hub needs it
-        jobs.append(("The web page", lambda: web.serve(settings, log)))
+        jobs.append(("The web page", lambda: web.serve(settings, log, health)))
 
     def keep(name, job):
         while True:
@@ -445,6 +510,12 @@ def check(settings):
                f"{time.monotonic() - started:.1f} s" if msg.get("tool_calls") else "the model answered without calling the tool")
     except llm.LLMError as e:
         report("Tool calling", False, str(e))
+    if settings.anonymize:
+        from . import anonymize
+        anonymize.setup(settings)
+        anonymize.known(list(box.clusters), "cluster")
+        sample = f"{box.here} -> {anonymize.TABLE.hide(box.here)}, 10.1.2.3 -> {anonymize.TABLE.hide('10.1.2.3')}"
+        report("Anonymize", True, f"on: {len(anonymize.TABLE.real)} names hidden, e.g. {sample}")
     other = config.for_learning(settings)
     if (other.llm_url, other.llm_model) != (settings.llm_url, settings.llm_model):
         try:

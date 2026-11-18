@@ -14,7 +14,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from . import config, hosts
+from . import anonymize, config, hosts
 from .redact import clean
 from .run import run
 
@@ -313,6 +313,8 @@ class Toolbox:
             clusters = find_clusters(settings.kube_dir) if settings.kubernetes else {}
         self.clusters = clusters
         self.here, self.agents = config.here(), config.agents(settings)  # agents: only on the hub
+        if settings.anonymize:
+            anonymize.known(list(self.clusters), "cluster")
         ids = tuple(self.clusters)
         current = re.sub(r"[^A-Za-z0-9_.\-]", "-", os.environ.get("KUBE_CURRENT", ""))
         self.active = current if current in self.clusters else next(iter(ids), None)

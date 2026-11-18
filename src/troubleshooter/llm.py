@@ -6,6 +6,7 @@ import time
 import urllib.error
 import urllib.request
 
+from . import anonymize
 from .redact import mask, strip_control
 
 _THINK = re.compile(r"<think>.*?(</think>|\Z)", re.S)
@@ -231,7 +232,23 @@ def _once(s, body, on_text):
 
 
 def chat(s, messages, tools=None, on_text=lambda t: None, on_wait=lambda text: None, sleep=time.sleep):
-    """One model turn, waiting out a busy server. Returns (assistant message, finish reason)."""
+    """One model turn, waiting out a busy server. Returns (assistant message, finish reason).
+
+    With anonymize on, the model sees stand-ins for host names, IPs and chosen words, and its answer
+    and tool calls come back with the real ones.
+    """
+    if not s.anonymize:
+        return _turn(s, messages, tools, on_text, on_wait, sleep)
+    anonymize.setup(s)
+    shown = anonymize.Streamed(on_text)
+    try:
+        message, finish = _turn(s, anonymize.hide_messages(messages), anonymize.hide_tools(tools), shown, on_wait, sleep)
+    finally:
+        shown.flush()
+    return anonymize.show_message(message), finish
+
+
+def _turn(s, messages, tools, on_text, on_wait, sleep):
     body, waited, delay = _body(s, messages, tools), 0, 5
     while True:
         try:
