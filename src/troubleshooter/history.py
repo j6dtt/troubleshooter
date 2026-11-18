@@ -136,6 +136,7 @@ def _kube(box, cid):
 
 def take(box):
     """The state now. A part that could not be read is None, and is then not compared."""
+    box.refresh()
     with ThreadPoolExecutor(max_workers=8) as pool:
         docker = pool.submit(_docker)
         kube = dict(zip(box.clusters, pool.map(lambda cid: _kube(box, cid), box.clusters)))

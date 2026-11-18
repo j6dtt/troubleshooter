@@ -1561,10 +1561,12 @@ class Page(unittest.TestCase):
             return r, "stop"
         with mock.patch.object(llm, "chat", fake), mock.patch.object(tools, "run", lambda *a, **k: reply(True, "NAMES\nweb Exited")):
             self.assertTrue(chat.run(lambda: chat.ask("why is web down?", "")))
-            for _ in range(200):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
                 rows, busy = chat.since(0)
                 if not busy:
                     break
+                time.sleep(0.01)
         kinds = [e["t"] for e in rows]
         self.assertEqual(kinds, ["ask", "step", "result", "text", "done"])
         self.assertEqual(rows[1]["d"], "Listed containers")
@@ -1578,9 +1580,9 @@ class Page(unittest.TestCase):
         self.assertTrue(chat.run(gate.wait))
         self.assertFalse(chat.run(lambda: None))
         gate.set()
-        for _ in range(200):
-            if not chat.since(0)[1]:
-                break
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and chat.since(0)[1]:
+            time.sleep(0.01)
         chat.stopped = True
         with self.assertRaises(KeyboardInterrupt):
             chat.text("more")
@@ -1639,7 +1641,8 @@ class Page(unittest.TestCase):
         state = self.site.health.state()
         self.assertEqual(state["problems"][0]["lane"], self.site.health.box.here)
         self.assertEqual(state["hosts"][0]["name"], self.site.health.box.here)
-        self.assertEqual(state["clusters"], [{"name": "vks-a", "kind": "Kubernetes", "line": "3 nodes", "problems": 0}])
+        self.assertEqual(state["clusters"], [{"name": "vks-a", "kind": "Kubernetes", "line": "3 nodes", "problems": 0,
+                                              "role": "", "expired": False, "context": ""}])
 
     def test_a_host_that_cannot_say_is_shown_with_the_reason(self):
         patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02", "host-03"), kube_dir="/none", log_dir=self.s.log_dir)
@@ -1761,6 +1764,16 @@ class Auto(unittest.TestCase):
         self.assertEqual(states, ["limit", "waiting", "waiting"])                   # 2 an hour
         self.assertEqual(self.site.health.auto.waiting.qsize(), 2)
         self.assertTrue(any("started 2 min after: container relay" in line for line in self.logged))
+
+    def test_a_new_login_brings_problems_that_are_shown_not_traced(self):
+        box = self.site.health.box
+        with mock.patch.object(history, "record", lambda box: None), mock.patch.object(history, "events", lambda s, since: []):
+            self.rounds({})
+            box.first_seen = {**box.first_seen, "prod1": time.time() + 1}  # a login added after the last round
+            self.rounds({"KUBERNETES prod1|pod|x": "kubernetes prod1: pod shop/web: CrashLoopBackOff"})
+        got = self.site.health.state()["problems"][0]
+        self.assertEqual((got["lane"], got["known"], got["trace"]), ("prod1", True, None))
+        self.assertEqual(self.site.health.auto.waiting.qsize(), 0)
 
     def test_off_means_no_trace_at_all(self):
         self.site.health.auto.s = dataclasses.replace(self.site.health.auto.s, auto_trace=False)
@@ -2109,6 +2122,155 @@ class Runbooks(unittest.TestCase):
         s = replace(Settings(), host_root=d, file_roots=("/apps",), llm_url="http://x", llm_model="m")
         with redirect_stderr(io.StringIO()):
             self.assertEqual(learn.main(s, ["/etc"]), 2)
+
+
+def stamp(seconds_ago):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
+
+
+class VsphereScope(unittest.TestCase):
+    """Three logins, as kubectl vsphere login writes them: the Supervisor itself (named by its address, no
+    namespace), a vSphere namespace (team-a, twice: two contexts on the same namespace), and a VKS workload cluster."""
+
+    def setUp(self):
+        self.calls, self.expired = [], set()
+        self.box = tools.Toolbox(Settings(), clusters={
+            "sup-ip": tools.Cluster("sup-ip", "/k", "sup-ip", api="https://sup"),
+            "team-a": tools.Cluster("team-a", "/k", "team-a", namespace="team-a", api="https://sup"),
+            "team-a-again": tools.Cluster("team-a-again", "/k", "team-a-again", namespace="team-a", api="https://sup"),
+            "prod1": tools.Cluster("prod1", "/k", "prod1", api="https://prod1")})
+        patch = mock.patch.object(tools, "run", self.kubectl)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def kubectl(self, argv, timeout=30, parsed=False):
+        self.calls.append(argv)
+        ctx = argv[argv.index("--context") + 1]
+        if ctx in self.expired:
+            return reply(False, "error: You must be logged in to the server (Unauthorized)")
+        supervisor = ctx != "prod1"
+        if "/apis/cluster.x-k8s.io" in argv:
+            return reply(True, "{}") if supervisor else reply(False, "Error from server (NotFound): not found")
+        if "events" in argv:
+            return reply(True, "")
+        kind = argv[argv.index("get") + 1]
+        if supervisor:  # a namespace user: nothing across the Supervisor, everything in team-a
+            if "--all-namespaces" in argv or kind == "nodes" or ("-n" in argv and argv[argv.index("-n") + 1] != "team-a"):
+                return reply(False, f"Error from server (Forbidden): {kind} is forbidden")
+            items = {"persistentvolumeclaims": [vks_item("data-1", status={"phase": "Bound"}),
+                                                vks_item("data-2", status={"phase": "Pending"})],
+                     "pods": []}.get(kind, VKS.get(kind, []))
+            return reply(True, json.dumps({"items": items}))
+        if kind == "nodes":
+            return reply(True, json.dumps({"items": [{"metadata": {"name": "n1"}, "status": {"conditions": [
+                {"type": "Ready", "status": "True"}]}}]}))
+        old = pod("old-restarts", restarts=9, ended=stamp(40 * 86400))
+        crash = pod("crashing", ready=False, restarts=6, ended=stamp(120))
+        evicted = {"metadata": {"name": "evicted", "namespace": "shop"},
+                   "status": {"phase": "Failed", "reason": "Evicted", "startTime": stamp(30 * 86400)}}
+        fresh = {"metadata": {"name": "just-failed", "namespace": "shop"},
+                 "status": {"phase": "Failed", "reason": "Error", "startTime": stamp(600)}}
+        return reply(True, json.dumps({"items": [old, crash, evicted, fresh, pod("fine")]}))
+
+    def survey(self):
+        got = watch.kube_survey(self.box)
+        return got, {row["where"]: row for row in got["lines"]}
+
+    def test_each_login_gets_its_own_kind_of_card(self):
+        got, cards = self.survey()
+        self.assertEqual(cards["sup-ip"]["role"], "supervisor")
+        self.assertIn("sees only its vSphere namespaces", cards["sup-ip"]["line"])
+        self.assertEqual(cards["sup-ip"]["problems"], 0)
+        ns = cards["team-a"]
+        self.assertEqual(ns["role"], "namespace")
+        self.assertIn("2 VKS cluster(s) (other, prod1)", ns["line"])
+        self.assertIn("3 VMs", ns["line"])
+        self.assertEqual(ns["problems"], 1)  # the claim that is not bound; Forbidden is never one
+        self.assertEqual([v for v in got["problems"].values() if "claim" in v], ["kubernetes team-a: claim data-2: Pending"])
+        self.assertNotIn("team-a-again", cards)  # the same namespace through a second context: one card
+        self.assertEqual(cards["team-a/prod1"]["role"], "vks")
+        self.assertEqual(cards["team-a/prod1"]["context"], "team-a")
+        self.assertGreater(cards["team-a/prod1"]["problems"], 0)
+        self.assertEqual(cards["prod1"]["role"], "cluster")
+        self.assertNotIn("forbidden", " ".join(got["problems"].values()).lower())
+
+    def test_a_vsphere_namespace_is_looked_at_once(self):
+        self.survey()
+        scans = [c for c in self.calls if "clusters.cluster.x-k8s.io" in c and "-n" in c]
+        self.assertEqual({c[c.index("--context") + 1] for c in scans}, {"team-a"})
+        health = [c for c in self.calls if "kubeadmcontrolplanes.controlplane.cluster.x-k8s.io" in c and "-n" in c]
+        self.assertEqual(len(health), 1)
+
+    def test_old_restarts_and_old_failed_pods_are_not_problems(self):
+        got, cards = self.survey()
+        said = [v for k, v in got["problems"].items() if k.startswith("KUBERNETES prod1")]
+        self.assertTrue(any("crashing" in v and "restarted 6 times, last 2 min ago" in v for v in said), said)
+        self.assertTrue(any("just-failed" in v for v in said))
+        self.assertFalse(any("old-restarts" in v or "evicted" in v for v in said))
+        self.assertIn("1 old failed pod(s) left over", cards["prod1"]["line"])
+        # a tool, asked about the pod, still says it
+        self.assertIn("restarted 9 times, last 40 days ago", tools.Toolbox._pod_trouble(pod("old-restarts", restarts=9, ended=stamp(40 * 86400))))
+
+    def test_an_expired_login_is_said_not_counted(self):
+        self.expired = {"team-a", "team-a-again", "prod1"}
+        self.box.roles.pop("prod1", None)
+        got, cards = self.survey()
+        self.assertTrue(cards["prod1"]["expired"])
+        self.assertIn("login expired", cards["prod1"]["line"])
+        self.assertTrue(cards["team-a"]["expired"])
+        self.assertEqual(cards["team-a"]["problems"], 0)
+        self.assertFalse(any(k.startswith(("KUBERNETES prod1", "KUBERNETES team-a")) for k in got["problems"]))
+
+
+class KubeHome(unittest.TestCase):
+    """Your ~/.kube/config, mounted: its contexts keep their names and namespaces, and a new login is read again."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.dir = tempfile.mkdtemp()
+        self.cfg = {"clusters": [{"name": "sup", "cluster": {"server": "https://sup"}}],
+                    "users": [{"name": "me", "user": {}}],
+                    "contexts": [{"name": "10.0.0.9", "context": {"cluster": "sup", "user": "me"}},
+                                 {"name": "team-a", "context": {"cluster": "sup", "user": "me", "namespace": "team-a"}}]}
+        self.write()
+        patch = mock.patch.object(tools, "_read_kubeconfig", lambda path: self.cfg)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def write(self, extra=""):
+        path = os.path.join(self.home, "config")
+        with open(path, "w") as f:
+            f.write("x" + extra)
+        st = os.stat(path)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9 * len(extra)))
+
+    def test_contexts_keep_their_names_namespaces_and_server(self):
+        found = tools.find_clusters(self.dir, self.home)
+        self.assertEqual(sorted(found), ["10.0.0.9", "team-a"])
+        self.assertEqual(found["team-a"].namespace, "team-a")
+        self.assertEqual(found["team-a"].api, "https://sup")
+        self.assertEqual(found["10.0.0.9"].namespace, "")
+
+    def test_a_new_login_shows_up_without_a_restart(self):
+        logged = []
+        box = tools.Toolbox(Settings(kube_dir=self.dir, kube_home=self.home))
+        box.log = logged.append
+        self.assertEqual(sorted(box.clusters), ["10.0.0.9", "team-a"])
+        self.assertFalse(box.refresh())  # nothing changed: nothing read
+        self.cfg["contexts"].append({"name": "prod1", "context": {"cluster": "sup", "user": "me"}})
+        self.write("more")
+        self.assertTrue(box.refresh())
+        self.assertIn("prod1", box.clusters)
+        self.assertIn("prod1", box.tools["k8s_use_context"].params["context"].enum)
+        self.assertEqual(logged, ["The Kubernetes logins changed: added prod1"])
+
+    def test_a_folder_file_wins_over_the_same_name_at_home(self):
+        with open(os.path.join(self.dir, "team-a.yaml"), "w") as f:
+            f.write("x")
+        one = {**self.cfg, "contexts": self.cfg["contexts"][1:]}
+        with mock.patch.object(tools, "_read_kubeconfig", lambda path: one if path.endswith(".yaml") else self.cfg):
+            found = tools.find_clusters(self.dir, self.home)
+        self.assertEqual(found["team-a"].file, os.path.join(self.dir, "team-a.yaml"))
 
 
 if __name__ == "__main__":

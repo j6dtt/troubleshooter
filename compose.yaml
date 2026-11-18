@@ -102,6 +102,13 @@ x-settings:
   # Clusters need no setting: one kubeconfig per cluster in ./kube,
   # named after the cluster. Make them with
   # scripts/make-kubeconfig.sh. Empty = no Kubernetes.
+  # Your own ~/.kube (hub, or a host alone): every context that
+  # kubectl vsphere login writes there is watched, with no restart;
+  # a new login shows on the page within a minute. Full path, not ~
+  # (under sudo, ~ is root's). It is your login: everyone on the
+  # page sees with your rights. Example: "/home/you/.kube".
+  # The default is an empty folder made here: nothing is read.
+  kube-home: &kube-home "./kube-home"
 
 # Start:  docker compose up -d
 # Test:   ./ts check
@@ -176,6 +183,12 @@ services:
       - ./src:/app/src:ro
       - ./logs:/logs
       - ./kube:/kube:ro
+      - type: bind
+        source: *kube-home
+        target: /kube-home
+        read_only: true
+        bind:
+          create_host_path: true
       - ./certs:/certs:ro
       - ./runbooks:/runbooks:ro
       - /var/run/docker.sock:/var/run/docker.sock

@@ -11,6 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from . import history, hosts
+from .tools import EXPIRED
 
 EVERY = 60       # seconds between rounds; ./ts watch --every N changes it
 SHORTEST = 15
@@ -117,14 +118,34 @@ def local_problems(box):
 
 
 def kube_survey(box):
-    """Every context, and the VKS clusters a Supervisor manages."""
-    found, lines = {}, []
+    """Every context, and the VKS clusters a Supervisor manages. The kubeconfigs are read again first when one
+    changed, so a new login is watched from the next round on. Two contexts on the same vSphere namespace are
+    looked at once."""
+    box.refresh()
+    found, lines, ids, spaces = {}, [], [], set()
+    for cid, c in list(box.clusters.items()):
+        if getattr(c, "namespace", "") and box._role(cid) == "supervisor":
+            if (c.api or cid, c.namespace) in spaces:
+                continue  # the same vSphere namespace through another context: one card is enough
+            spaces.add((c.api or cid, c.namespace))
+        ids.append(cid)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for part in pool.map(box._k8s_summary, list(box.clusters)):
-            _section(found, part, lines)
-    for cid in box.clusters:
-        if box.roles.get(cid) != "supervisor" and box._role(cid) != "supervisor":
+        parts = list(pool.map(box._k8s_summary, ids))
+    kinds = {cid: box.kind_of(cid) for cid in ids}
+    for cid, part in zip(ids, parts):
+        _section(found, part, lines)
+        if lines and lines[-1]["kind"] == "Kubernetes":
+            lines[-1]["role"] = kinds[cid]
+            lines[-1]["expired"] = part.splitlines()[0].endswith(EXPIRED)
+    seen = set()
+    for cid in ids:
+        if box.roles.get(cid) != "supervisor":
             continue
+        c = box.clusters[cid]
+        where = (getattr(c, "api", "") or cid, getattr(c, "namespace", ""))
+        if where in seen:
+            continue
+        seen.add(where)
         try:
             cluster, count = "", {}
             for row in box.vks_cluster_health(cid, None, None).splitlines():
@@ -134,7 +155,8 @@ def kube_survey(box):
                 elif row.lstrip().startswith("- ") and cluster:
                     found[key(f"vks {cid} {cluster}", row)] = f"VKS cluster {cluster}: {row.strip()[2:]}"
                     count[cluster][1] += 1
-            lines += [{"kind": "VKS cluster", "where": c, "line": text, "problems": n} for c, (text, n) in count.items()]
+            lines += [{"kind": "VKS cluster", "where": name, "line": text, "problems": n, "role": "vks", "context": cid}
+                      for name, (text, n) in count.items() if not any(x["where"] == name for x in lines)]
         except Exception:
             pass
     return {"problems": found, "lines": lines}

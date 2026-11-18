@@ -3,11 +3,13 @@
 Every argument is checked here and passed as one fixed argv item. There is no shell and no
 free-form command tool, so a bad argument (or a poisoned log line) can't widen what runs.
 """
+import datetime
 import json
 import os
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -104,9 +106,32 @@ CHECKS = {
 }
 
 
+LOGIN_REFUSED = re.compile(r"Unauthorized|must be logged in")
+EXPIRED = "login expired: run kubectl vsphere login again"
+RECENT = 3600        # a restart this recent counts in the watch
+LEFTOVER = 86400     # a pod that failed longer ago than this is left over, not a problem now
+
+
+def when(stamp):
+    """Seconds since 1970 for a Kubernetes time such as 2026-11-18T05:42:00Z, or 0."""
+    try:
+        return datetime.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp() if stamp else 0
+    except ValueError:
+        return 0
+
+
+def ago(seconds):
+    seconds = max(0, int(seconds))
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "min")):
+        if seconds >= size:
+            n = seconds // size
+            return f"{n} {unit}" + ("s" if n > 1 and unit != "min" else "")
+    return f"{seconds} s"
+
+
 def kube_error(text):
     """kubectl repeats itself and prefixes noise; the last line says what went wrong."""
-    if re.search(r"Unauthorized|must be logged in", text):
+    if LOGIN_REFUSED.search(text):
         return "the login was refused: the token has expired or is wrong."
     return (text.strip().splitlines() or ["no answer"])[-1][:200]
 
@@ -236,6 +261,7 @@ class Cluster:
     login_tool: str = ""  # a program the kubeconfig runs to log in; must exist in this container
     server: str = ""      # set for your own login: the kubectl proxy that ./ts started on the host
     namespace: str = ""   # the context's own namespace, used when none is given
+    api: str = ""         # the API server's address, so two contexts on one Supervisor namespace are looked at once
 
 
 def conditions(obj):
@@ -277,58 +303,124 @@ def amount(text):
     return float(m[1]) * SIZES.get(m[2], 1)
 
 
-def find_clusters(kube_dir):
-    """Your current login (through ./ts), then every context of every file in the folder.
+def kube_files(kube_dir, kube_home=""):
+    """Every kubeconfig read, with when it last changed: a new login changes this, and the contexts are read again."""
+    paths = []
+    try:
+        paths = sorted(e.path for e in os.scandir(kube_dir) if e.is_file() and not e.name.startswith("."))
+    except OSError:
+        pass
+    if kube_home and os.path.isfile(os.path.join(kube_home, "config")):
+        paths.append(os.path.join(kube_home, "config"))
+    found = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+            found.append((path, st.st_mtime_ns, st.st_size))
+        except OSError:
+            pass
+    return tuple(found)
 
-    One file with one context is named after the file.
+
+def _read_kubeconfig(path):
+    r = run(["kubectl", "config", "view", "--kubeconfig", path, "-o", "json"], parsed=True)
+    if not r.ok:
+        return None
+    try:
+        return json.loads(r.text)
+    except ValueError:
+        return None
+
+
+def find_clusters(kube_dir, kube_home=""):
+    """Your current login (through ./ts), then every context of every file in the folder, then your own
+    ~/.kube/config when it is mounted (the logins kubectl vsphere login writes).
+
+    A file in the folder with one context is named after the file; a context in ~/.kube/config keeps its own
+    name. A name already found is not read twice.
     """
     found = {}
     for row in filter(None, os.environ.get("KUBE_PROXIES", "").split(";")):
         context, port, namespace = (row.split("|") + ["", ""])[:3]
         cid = re.sub(r"[^A-Za-z0-9_.\-]", "-", context)
         found[cid] = Cluster(cid, "", context, server=f"http://127.0.0.1:{port}", namespace=namespace)
-    try:
-        files = sorted(e.path for e in os.scandir(kube_dir) if e.is_file() and not e.name.startswith("."))
-    except OSError:
-        return found
-    for path in files:
-        r = run(["kubectl", "config", "view", "--kubeconfig", path, "-o", "json"], parsed=True)
-        if not r.ok:
+    home = os.path.join(kube_home, "config") if kube_home else ""
+    for path, _, _ in kube_files(kube_dir, kube_home):
+        cfg = _read_kubeconfig(path)
+        if not cfg:
             continue
-        cfg = json.loads(r.text)
         users = {u["name"]: (u.get("user", {}).get("exec") or {}).get("command", "") for u in cfg.get("users") or []}
+        apis = {c["name"]: (c.get("cluster") or {}).get("server", "") for c in cfg.get("clusters") or []}
         contexts = cfg.get("contexts") or []
         stem = os.path.splitext(os.path.basename(path))[0]
         for c in contexts:
-            cid = stem if len(contexts) == 1 else f"{stem}.{c['name']}"
+            cid = c["name"] if path == home else stem if len(contexts) == 1 else f"{stem}.{c['name']}"
             cid = re.sub(r"[^A-Za-z0-9_.\-]", "-", cid)
-            found[cid] = Cluster(cid, path, c["name"], users.get(c.get("context", {}).get("user"), ""))
+            if cid in found:
+                continue
+            ctx = c.get("context") or {}
+            found[cid] = Cluster(cid, path, c["name"], users.get(ctx.get("user"), ""),
+                                 namespace=ctx.get("namespace") or "", api=apis.get(ctx.get("cluster"), ""))
+    for c in found.values():
+        if c.server and not c.api:
+            c.api = c.server
     return found
 
 
 class Toolbox:
+    LOADING = threading.Lock()
+
     def __init__(self, settings, clusters=None):
         self.s = settings
-        if clusters is None:
-            clusters = find_clusters(settings.kube_dir) if settings.kubernetes else {}
-        self.clusters = clusters
         self.here, self.agents = config.here(), config.agents(settings)  # agents: only on the hub
-        if settings.anonymize:
-            anonymize.known(list(self.clusters), "cluster")
-        ids = tuple(self.clusters)
-        current = re.sub(r"[^A-Za-z0-9_.\-]", "-", os.environ.get("KUBE_CURRENT", ""))
-        self.active = current if current in self.clusters else next(iter(ids), None)
         self.roles = {}  # context -> "supervisor" or "workload", once known
+        self.fixed, self.seen, self.log = clusters is not None, None, None
+        self.clusters, self.active, self.tools = {}, None, {}
+        self.first_seen = {}  # context -> when it was first read: problems a new login brings are already open
+        if self.fixed:
+            self._load(clusters)
+        else:
+            self.refresh()
+
+    def refresh(self):
+        """Reads the kubeconfigs again when one has changed, so a new login shows up without a restart.
+        Only the files' times are looked at when nothing changed. True when the contexts were read again."""
+        if self.fixed:
+            return False
+        files = kube_files(self.s.kube_dir, self.s.kube_home) if self.s.kubernetes else ()
+        if files == self.seen:
+            return False
+        with Toolbox.LOADING:
+            if files == self.seen:
+                return False
+            before = set(self.clusters)
+            self._load(find_clusters(self.s.kube_dir, self.s.kube_home) if self.s.kubernetes else {})
+            first, self.seen = self.seen is None, files
+        added, gone = sorted(set(self.clusters) - before), sorted(before - set(self.clusters))
+        if self.log and not first and (added or gone):
+            self.log("The Kubernetes logins changed: " + "; ".join(
+                ([f"added {', '.join(added)}"] if added else []) + ([f"gone {', '.join(gone)}"] if gone else [])))
+        return True
+
+    def _load(self, clusters):
+        if self.s.anonymize:
+            anonymize.known(list(clusters), "cluster")
+        ids = tuple(clusters)
+        current = re.sub(r"[^A-Za-z0-9_.\-]", "-", os.environ.get("KUBE_CURRENT", ""))
+        active = self.active if self.active in clusters else current if current in clusters else next(iter(ids), None)
         which = P("string", "Context (default: the active one)", False, ids)
-        self.tools = {}
-        for t in self._define():
-            if (t.needs_kube and not ids) or (t.change and not settings.allow_changes):
+        tools = {}
+        for t in self._define(ids):
+            if (t.needs_kube and not ids) or (t.change and not self.s.allow_changes):
                 continue
             if t.needs_kube and t.per_cluster:
                 t.params = {"cluster": which, **t.params}
             if self.agents and not (t.needs_kube or t.change or t.name in hosts.NOT_ASKED or t.name in ("k8s_contexts", "k8s_use_context")):
                 self._on_any_host(t)
-            self.tools[t.name] = t
+            tools[t.name] = t
+        now = time.time()
+        self.first_seen = {cid: self.first_seen.get(cid, now) for cid in clusters}
+        self.clusters, self.active, self.tools = clusters, active, tools
 
     def _on_any_host(self, tool):
         """On the hub, a tool that looks at one machine can look at another host's, through its agent."""
@@ -524,11 +616,27 @@ class Toolbox:
         text.append(f"services: {len(services.splitlines())}")
         return "\n".join(text)
 
+    def kind_of(self, cid):
+        """What a context looks at: "namespace" (a vSphere namespace on a Supervisor), "supervisor" (the
+        Supervisor itself) or "cluster" (any other cluster, such as a VKS workload cluster)."""
+        if self._role(cid) == "supervisor":
+            return "namespace" if self._cluster(cid).namespace else "supervisor"
+        return "cluster"
+
     def _k8s_summary(self, cid):
-        """Forbidden is normal for a namespace user: say so and show what the login can see."""
+        """Forbidden is normal for a namespace user: say what the login can see, and never count it as a problem.
+        A login that has expired is said as such, and is not a problem either: it needs you, not a fix."""
+        kind = self.kind_of(cid)
+        if kind == "namespace":
+            return self._namespace_summary(cid)
         r = run(self._kubectl(cid, "get", "nodes", "-o", "json"), parsed=True)
         if not r.ok and "Forbidden" not in r.text:
+            if LOGIN_REFUSED.search(r.text):
+                return f"KUBERNETES {cid}: {EXPIRED}"
             return f"KUBERNETES {cid}: not reachable: {kube_error(r.text)}"
+        if not r.ok and kind == "supervisor":
+            return (f"KUBERNETES {cid}: login ok; this login sees only its vSphere namespaces, "
+                    "each on its own card")
         nodes = json.loads(r.text)["items"] if r.ok else []
         text = []
         for n in nodes:
@@ -542,34 +650,87 @@ class Toolbox:
         if not pods.ok and "Forbidden" in pods.text:
             scope = f"namespace {self._ns1(cid, None)} only"
             pods = run(self._kubectl(cid, "get", "pods", "-n", self._ns1(cid, None), "-o", "json"), parsed=True)
-        total = 0
-        if pods.ok:
-            items = json.loads(pods.text)["items"]
-            total = len(items)
-            for p in items:
-                why = self._pod_trouble(p)
-                if why:
-                    text.append(f"- pod {p['metadata']['namespace']}/{p['metadata']['name']}: {why}")
-        else:
-            text.append(f"- pods: {kube_error(pods.text)}")
         count = f"{len(nodes)} nodes" if r.ok else "nodes hidden (no permission)"
-        return "\n".join([f"KUBERNETES {cid}: {count}, {total} pods in {scope}; {len(text)} need a look"] + text[:40])
+        if not pods.ok:
+            seen = "pods hidden (no permission)" if "Forbidden" in pods.text else f"pods not read: {kube_error(pods.text)}"
+            return "\n".join([f"KUBERNETES {cid}: {count}, {seen}; {len(text)} need a look"] + text[:40])
+        items, now, old = json.loads(pods.text)["items"], time.time(), 0
+        for p in items:
+            if self._leftover(p, now):
+                old += 1
+                continue
+            why = self._pod_trouble(p, now, recent=True)
+            if why:
+                text.append(f"- pod {p['metadata']['namespace']}/{p['metadata']['name']}: {why}")
+        leftovers = f", {old} old failed pod(s) left over" if old else ""
+        return "\n".join([f"KUBERNETES {cid}: {count}, {len(items)} pods in {scope}{leftovers}; "
+                          f"{len(text)} need a look"] + text[:40])
+
+    def _namespace_summary(self, cid):
+        """A vSphere namespace on a Supervisor: what lives in it. Its VKS clusters get their own cards; here they
+        are only counted. Problems here: claims not bound, and vSphere Pods in trouble (only with NSX)."""
+        ns = self._cluster(cid).namespace
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            clusters, vms, pvcs, pods = pool.map(lambda kind: self._vks_list(cid, kind, ns), (
+                VKS_KINDS["clusters"], VKS_KINDS["vms"], "persistentvolumeclaims", "pods"))
+        for _, problem in (clusters, vms, pvcs, pods):
+            if problem.startswith("the login was refused"):
+                return f"KUBERNETES {cid}: {EXPIRED}"
+        text, now = [], time.time()
+        for c in pvcs[0]:
+            phase = (c.get("status") or {}).get("phase", "unknown")
+            if phase != "Bound":
+                text.append(f"- claim {c['metadata']['name']}: {phase}")
+        for p in pods[0]:
+            why = "" if self._leftover(p, now) else self._pod_trouble(p, now, recent=True)
+            if why:
+                text.append(f"- vSphere pod {p['metadata']['name']}: {why}")
+        names = sorted(c["metadata"]["name"] for c in clusters[0])
+        said = [f"{len(names)} VKS cluster(s)" + (f" ({', '.join(names[:6])})" if names else "") if not clusters[1]
+                else "VKS clusters hidden", f"{len(vms[0])} VMs" if not vms[1] else "VMs hidden",
+                f"{len(pvcs[0])} claims" if not pvcs[1] else "claims hidden"]
+        if pods[0]:
+            said.append(f"{len(pods[0])} vSphere pods")
+        return "\n".join([f"KUBERNETES {cid}: vSphere namespace {ns}: {', '.join(said)}; {len(text)} need a look"]
+                         + text[:40])
 
     @staticmethod
-    def _pod_trouble(pod):
+    def _leftover(pod, now):
+        """A pod that failed more than a day ago and was never cleaned up (Evicted, a job's Error): not a problem now."""
+        status = pod.get("status") or {}
+        if status.get("phase") != "Failed":
+            return False
+        ended = when(status.get("startTime"))
+        for c in status.get("conditions") or []:
+            ended = max(ended, when(c.get("lastTransitionTime")))
+        for c in status.get("containerStatuses") or []:
+            ended = max(ended, when(((c.get("state") or {}).get("terminated") or {}).get("finishedAt")))
+        return bool(ended) and now - ended > LEFTOVER
+
+    @staticmethod
+    def _pod_trouble(pod, now=None, recent=False):
+        """What is wrong with a pod. Restarts say when the last one was; with recent=True (the watch), restarts
+        count only when the last one was within the hour: the count never goes back to 0 by itself."""
+        now = now or time.time()
         status = pod.get("status", {})
         phase = status.get("phase")
         if phase == "Succeeded":
             return ""
         notes = [] if phase == "Running" else [phase or "unknown phase"]
+        if phase == "Failed" and status.get("reason"):
+            notes[0] += f" ({status['reason']})"
         for c in status.get("containerStatuses", []):
             waiting = c.get("state", {}).get("waiting", {}).get("reason")
             if waiting:
                 notes.append(waiting)
-            elif not c.get("ready"):
+            elif not c.get("ready") and phase != "Failed":
                 notes.append(f"{c['name']} not ready")
             if c.get("restartCount", 0) >= 5:
-                notes.append(f"{c['name']} restarted {c['restartCount']} times")
+                last = when(((c.get("lastState") or {}).get("terminated") or {}).get("finishedAt"))
+                if recent and not (waiting or (last and now - last < RECENT)):
+                    continue
+                notes.append(f"{c['name']} restarted {c['restartCount']} times"
+                             + (f", last {ago(now - last)} ago" if last else ""))
         return ", ".join(notes)
 
     # ---------- Docker ----------
@@ -1353,7 +1514,7 @@ class Toolbox:
                       self._kubectl(c.id, "scale", f"{kind}/{r}", f"--replicas={replicas}", "-n", n))
 
     # ---------- Catalogue ----------
-    def _define(self):
+    def _define(self, ids=()):
         cont = P("string", "Container name", True)
         tail = P("integer", "Newest lines to return (default 200)")
         when = P("string", "Only this recent, e.g. 30m, 2h, 1d")
@@ -1387,7 +1548,7 @@ class Toolbox:
               "Listed Kubernetes contexts", self.k8s_contexts, needs_kube=True, per_cluster=False),
             t("k8s_use_context", "Switch the active context for this chat. The kubeconfig is not changed.",
               "Switched to context {context}", self.k8s_use_context,
-              {"context": P("string", "Context name", True, tuple(self.clusters))}, needs_kube=True, per_cluster=False),
+              {"context": P("string", "Context name", True, ids)}, needs_kube=True, per_cluster=False),
             t("docker_list", "List containers with image and status.", "Listed containers",
               lambda include_stopped: self.docker_list(include_stopped),
               {"include_stopped": P("boolean", "Also show stopped containers")}),

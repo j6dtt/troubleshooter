@@ -34,6 +34,7 @@ class Settings:
     host_root: str = "/host"
     log_dir: str = "/logs"
     kube_dir: str = "/kube"
+    kube_home: str = "/kube-home"   # your ~/.kube, mounted read-only: its config is read again when it changes
     runbook_dir: str = "/runbooks"
     learn_max_files: int = 40
     learn_minutes: int = 30
@@ -81,6 +82,7 @@ def load():
         host_root=os.environ.get("HOST_ROOT", "/host"),
         log_dir=os.environ.get("LOG_DIR", "/logs"),
         kube_dir=os.environ.get("KUBE_DIR", "/kube"),
+        kube_home=os.environ.get("KUBE_HOME", "/kube-home"),
         runbook_dir=os.environ.get("RUNBOOK_DIR", "/runbooks"),
         learn_max_files=int(os.environ.get("LEARN_MAX_FILES", "40")),
         learn_minutes=int(os.environ.get("LEARN_MINUTES", "30")),

@@ -140,6 +140,9 @@ class Session:
 
     def ask(self, question):
         self.log(f"You asked: {mask(question)}")
+        if self.box.refresh() and self.box.clusters:  # a new login since the chat started: tell the model
+            self.note += (f"(The Kubernetes contexts are now: {', '.join(self.box.clusters)}; "
+                          f"active: {self.box.active}.)\n")
         self.messages.append({"role": "user", "content": self.note + strip_control(mask(question))})
         self.note = ""
         seen = {}

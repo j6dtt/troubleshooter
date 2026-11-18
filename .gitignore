@@ -8,3 +8,4 @@ certs/*
 !certs/.gitkeep
 runbooks/*
 !runbooks/.gitkeep
+kube-home/

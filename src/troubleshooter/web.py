@@ -122,6 +122,7 @@ class Site:
         now = int(time.time())
         since = now - max(1, min(hours, 24 * history.KEEP_DAYS)) * 3600
         box = self.health.box
+        box.refresh()
         found = [{**e, "kind": "change", "lane": box.here if e["where"] == "Docker" else e["where"],
                   "where": e["where"] if e["where"] != "Docker" else f"Docker on {box.here}"}
                  for e in history.events(self.s, since)]

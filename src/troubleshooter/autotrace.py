@@ -137,6 +137,7 @@ class Health:
     def __init__(self, settings, log, mapping=True):
         self.s, self.log = settings, log
         self.box = Toolbox(dataclasses.replace(settings, allow_changes=False))
+        self.box.log = log
         self.lock = threading.Lock()
         self.open, self.lines, self.checked, self.failed = {}, [], 0, ""
         self.hosts, self.auto = [], None
@@ -203,8 +204,10 @@ class Health:
             first = not self.checked
             for k, text in seen["problems"].items():
                 if k not in self.open:
-                    self.open[k] = {"text": text, "since": now, "known": first, "lane": where(k)}
-                    if not first:
+                    # A login added since the last round brings problems that were there already: shown, not traced.
+                    known = first or getattr(self.box, "first_seen", {}).get(where(k), 0) > self.checked
+                    self.open[k] = {"text": text, "since": now, "known": known, "lane": where(k)}
+                    if not known:
                         added.append(k)
                         new.append({"time": now, "kind": "new", "text": text, "lane": where(k)})
                         self.log(f"The watch found a new problem: {text}")
@@ -287,7 +290,9 @@ class Health:
                                          "link": p.get("link"), "trace": p.get("trace")}
                                         for p in self.open.values()), key=lambda p: -p["since"]),
                     "lines": self.lines, "hosts": self.hosts, "events": self.events[-60:][::-1],
-                    "clusters": [{"name": c["where"], "kind": c["kind"], "line": c["line"], "problems": c["problems"]}
+                    "clusters": [{"name": c["where"], "kind": c["kind"], "line": c["line"], "problems": c["problems"],
+                                  "role": c.get("role", ""), "expired": c.get("expired", False),
+                                  "context": c.get("context", "")}
                                  for c in self.lines if c["kind"] in ("Kubernetes", "VKS cluster")]}
 
     def problem_events(self, since):

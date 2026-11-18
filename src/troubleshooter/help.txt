@@ -208,6 +208,50 @@ the pod down to VMware's side. It does not switch your context.
 Nothing is ever changed on a Supervisor: the fix tools refuse it. No
 Supervisor in the list: log in to it with kubectl, then run ./ts again.
 
+What Tracer looks at (its scope): vSphere namespaces and everything
+in them, and the VKS clusters themselves. Not vCenter, ESXi hosts,
+the Supervisor's own VMs or its system namespaces. When a problem
+points below a namespace (a VM that never gets an address, a host
+out of memory), Tracer says so: that is for the vSphere admin. Give
+it a login with namespace rights, never a vCenter admin account.
+
+Each login gets its own card on the page and its own kind of check:
+
+  Supervisor          (the context named by its address, no
+                      namespace) login ok or expired; nothing more,
+                      a namespace user sees nothing across it
+  vSphere namespace   its VKS clusters, VMs and claims; a claim not
+                      Bound and a vSphere Pod in trouble are problems
+  VKS cluster         seen from the Supervisor: control plane,
+                      worker pools, machines and their VMs
+  Kubernetes          a cluster seen from inside (prod1):
+                      nodes and pods in every namespace
+
+Not problems: "no permission" (Forbidden), restarts whose last one
+was over an hour ago, and pods that failed over a day ago and were
+left behind (Evicted, a job's Error); those are counted as "old
+failed pods left over". An expired login shows "login expired" with
+an orange dashed border; it is not traced. Two contexts on the same
+vSphere namespace make one card.
+
+YOUR OWN LOGINS ON THE PAGE (kube-home)
+
+Set kube-home in compose.yaml to your ~/.kube, full path. Then:
+
+  kubectl vsphere login --server=<supervisor> \
+    --tanzu-kubernetes-cluster-namespace team-a \
+    --tanzu-kubernetes-cluster-name prod1
+        -> ~/.kube/config changes
+        -> within a minute the watch reads it again
+        -> new cards on the page, no restart
+
+The log says "The Kubernetes logins changed: added prod1".
+Problems a new login brings are shown but not auto-traced: they were
+there before Tracer could see them. Tokens last about 10 hours; then
+the cards say "login expired" until you log in again. Everyone on the
+page sees with your login, look-only. ./kube still works, and a file
+there wins over a context of the same name in ~/.kube.
+
 SEVERAL HOSTS
 
 Every host runs the same code from the same folder. One is the hub;
@@ -398,6 +442,8 @@ docker compose up -d. Secrets go in .env.
   record-minutes       background snapshots of Docker, with no
                        chat open; 0 = off
   kubernetes           off = Docker and host only
+  kube-home            your ~/.kube, full path: its logins are
+                       watched and read again when they change
   hub-host             the host that serves the page and looks at
                        the others; empty = this host stands alone
   agent-hosts          the other hosts, separated by commas;
@@ -429,7 +475,11 @@ WHEN SOMETHING IS WRONG
   The login was refused
       Log in again with kubectl.
   Skip on Kubernetes in ./ts check
-      kubectl isn't working on this host, and ./kube is empty.
+      kubectl isn't working on this host, ./kube is empty, and no
+      ~/.kube is mounted (kube-home).
+  A card says "login expired"
+      Run kubectl vsphere login again; the card is back within a
+      minute.
   Answer cut off
       Raise llm-max-tokens.
   The conversation is too long
@@ -450,6 +500,7 @@ FILES
   logs/<date>.log    what happened, with every approval and decline,
                      what the hub asked an agent, and who signed in
   kube/              optional service-account logins, one per cluster
+  kube-home/         empty unless kube-home points elsewhere
   README.md          design and air-gapped install
 
 SAFETY

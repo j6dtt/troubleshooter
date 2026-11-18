@@ -477,7 +477,14 @@ def check(settings):
     if not settings.kubernetes:
         print("[skip] Kubernetes: turned off (kubernetes: off in compose.yaml)")
     elif not box.clusters:
-        print("[skip] Kubernetes: no kubectl login on this host, and nothing in ./kube")
+        print("[skip] Kubernetes: no kubectl login on this host, nothing in ./kube, and no ~/.kube mounted")
+    if settings.kubernetes:
+        home = os.path.join(settings.kube_home, "config")
+        if os.path.isfile(home):
+            n = sum(1 for c in box.clusters.values() if c.file == home)
+            print(f"[ok] Your ~/.kube: {n} context(s), read again within a minute of a new login")
+        else:
+            print("[skip] Your ~/.kube: not mounted (kube-home in compose.yaml)")
     for c in box.clusters.values():
         check_cluster(box, c, report)
     report("Host files", os.path.isdir(settings.host_root + "/etc"), settings.host_root)

@@ -356,6 +356,10 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
 .cards .card{display:flex;flex-direction:column;gap:10px}
 .cards .card.hot{border-color:var(--warn)}
 .cards .card.hub{border-color:var(--cyan)}
+.cards .card.stale{border-color:var(--warn);border-style:dashed}
+.cards .card.flash{box-shadow:0 0 0 2px var(--cyan)}
+.cardlinks{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.cardlinks button{min-height:32px;padding:0 10px;border-radius:6px;color:var(--cyan-text);font-size:13px}
 .cards .head{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
 .cards .name{font-weight:700;font-size:16px;overflow-wrap:anywhere}
 .squares{display:flex;flex-wrap:wrap;gap:5px}
@@ -878,13 +882,50 @@ JS = r'''"use strict";
     // clusters
     var cl = $("clusters"); clear(cl);
     $("cluster-block").hidden = !h.clusters.length;
-    h.clusters.forEach(function (c) {
-      var card = el("div", "card" + (c.problems ? " hot" : ""));
+    var ROLE = { supervisor: "Supervisor", namespace: "vSphere namespace", cluster: "Kubernetes", vks: "VKS cluster" };
+    var ORDER = { supervisor: 0, namespace: 1, vks: 2, cluster: 3 };
+    var cards = {};
+    function goCard(name) {
+      var t = cards[name];
+      if (!t) return;
+      t.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+      t.classList.add("flash");
+      setTimeout(function () { t.classList.remove("flash"); }, 1600);
+    }
+    function linkRow(card, label, names) {
+      if (!names.length) return;
+      var row = el("div", "cardlinks");
+      row.appendChild(el("span", "muted small", label));
+      names.forEach(function (n) {
+        var b = el("button", "", n.label);
+        b.type = "button";
+        b.title = "Go to the card of " + n.target;
+        b.addEventListener("click", function () { goCard(n.target); });
+        row.appendChild(b);
+      });
+      card.appendChild(row);
+    }
+    var sorted = h.clusters.slice().sort(function (a, b) { return (a.role in ORDER ? ORDER[a.role] : 3) - (b.role in ORDER ? ORDER[b.role] : 3); });
+    sorted.forEach(function (c) {
+      var card = el("div", "card" + (c.problems ? " hot" : c.expired ? " stale" : ""));
+      cards[c.name] = card;
       var head = el("div", "head");
       head.appendChild(el("span", "name", c.name));
-      head.appendChild(el("span", c.problems ? "warn small" : "okc small", c.problems ? "▲ " + c.problems + (c.problems === 1 ? " problem" : " problems") : "● healthy"));
+      head.appendChild(el("span", c.problems || c.expired ? "warn small" : "okc small",
+        c.problems ? "▲ " + c.problems + (c.problems === 1 ? " problem" : " problems") : c.expired ? "login expired" : "● healthy"));
       card.appendChild(head);
-      card.appendChild(el("span", "muted small", c.kind + " · " + c.line));
+      var line = c.expired ? "run kubectl vsphere login again" : c.line.replace(/^vSphere namespace [^:]+: /, "");
+      card.appendChild(el("span", "muted small", (ROLE[c.role] || c.kind) + " · " + line));
+      if (c.role === "namespace") {  // its VKS clusters, each with its own card
+        linkRow(card, "VKS clusters:", h.clusters.filter(function (x) { return x.role === "vks" && x.context === c.name; })
+          .map(function (x) { return { label: x.name.split("/").pop(), target: x.name }; }));
+      }
+      if (c.role === "vks") {  // the cluster seen from inside, when you have a login to it
+        var short = c.name.split("/").pop();
+        linkRow(card, "Inside:", h.clusters.filter(function (x) {
+          return x.role === "cluster" && (x.name === short || x.name.slice(-short.length - 1) === "." + short);
+        }).map(function (x) { return { label: x.name, target: x.name }; }));
+      }
       cl.appendChild(card);
     });
     // hosts
