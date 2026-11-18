@@ -807,9 +807,14 @@ JS = r'''"use strict";
     sessionStorage.removeItem("chat"); openChat();
   });
   // From the other views: open the trace with a question ready, about the right host.
-  function traceThis(question, host) {
+  function traceThis(question, lane) {
     show("trace");
-    if (host && me.hosts.indexOf(host) >= 0) $("host").value = host;
+    if (lane && me.hosts.indexOf(lane) >= 0) $("host").value = lane;
+    // A problem on a cluster: trace it on that context, not on whichever one the list shows.
+    if (lane && !busy && (me.contexts || []).indexOf(lane) >= 0 && $("context").value !== lane) {
+      $("context").value = lane;
+      $("context").dispatchEvent(new Event("change"));
+    }
     $("question").value = question;
     drawTrail();
     $("question").focus();
@@ -907,12 +912,13 @@ JS = r'''"use strict";
     }
     var sorted = h.clusters.slice().sort(function (a, b) { return (a.role in ORDER ? ORDER[a.role] : 3) - (b.role in ORDER ? ORDER[b.role] : 3); });
     sorted.forEach(function (c) {
-      var card = el("div", "card" + (c.problems ? " hot" : c.expired ? " stale" : ""));
+      var card = el("div", "card" + (c.problems ? " hot" : c.expired || c.paused ? " stale" : ""));
       cards[c.name] = card;
       var head = el("div", "head");
       head.appendChild(el("span", "name", c.name));
-      head.appendChild(el("span", c.problems || c.expired ? "warn small" : "okc small",
-        c.problems ? "▲ " + c.problems + (c.problems === 1 ? " problem" : " problems") : c.expired ? "login expired" : "● healthy"));
+      head.appendChild(el("span", c.problems || c.expired || c.paused ? "warn small" : c.blind ? "muted small" : "okc small",
+        c.problems ? "▲ " + c.problems + (c.problems === 1 ? " problem" : " problems")
+          : c.expired ? "login expired" : c.paused ? "paused" : c.blind ? "○ can't see" : "● healthy"));
       card.appendChild(head);
       var line = c.expired ? "run kubectl vsphere login again" : c.line.replace(/^vSphere namespace [^:]+: /, "");
       card.appendChild(el("span", "muted small", (ROLE[c.role] || c.kind) + " · " + line));

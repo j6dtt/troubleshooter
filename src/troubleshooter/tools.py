@@ -12,6 +12,7 @@ import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -88,7 +89,8 @@ VKS_KINDS = {"clusters": "clusters." + CAPI, "planes": "kubeadmcontrolplanes.con
              "pools": "machinedeployments." + CAPI, "machines": "machines." + CAPI,
              "vms": "virtualmachines.vmoperator.vmware.com"}
 CLUSTER_LABEL = CAPI + "/cluster-name"
-BUSY = {"Deleting", "Paused", "Remediating", "RollingOut", "ScalingUp", "ScalingDown", "Stalled"}  # True = worth saying
+BUSY = {"Deleting", "Paused", "Remediating", "RollingOut", "ScalingUp", "ScalingDown", "Stalled", "Updating"}  # True = worth saying
+PAUSED = "paused: VMware won't repair, scale or upgrade it until it is unpaused"
 SECRET_FILE = re.compile(r"(^|/)(\.env[^/]*|.*\.(key|pem|p12|pfx|jks|keystore|kdbx)|id_(rsa|dsa|ecdsa|ed25519)|"
                          r"shadow|gshadow|credentials?(\.\w+)?|\.netrc|\.pgpass|kubeconfig|client\.config)$", re.I)
 REAL_FS = ("ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "vfat", "nfs", "nfs4", "cifs", "ceph", "f2fs")
@@ -264,12 +266,14 @@ class Cluster:
     api: str = ""         # the API server's address, so two contexts on one Supervisor namespace are looked at once
 
 
-def conditions(obj):
+def conditions(obj, skip=()):
     """What a resource says is wrong with itself: each condition that is not as it should be."""
     status = obj.get("status") or {}
     found = {}
     for c in (status.get("conditions") or []) + ((status.get("v1beta2") or {}).get("conditions") or []):
         kind, state = c.get("type", "?"), c.get("status")
+        if kind in skip:
+            continue
         if (state == "True") == (kind in BUSY) and kind not in found:
             why = " ".join(x for x in (c.get("reason"), (c.get("message") or "").strip()) if x)
             found[kind] = f"{kind}={state}" + (f" ({why[:300]})" if why else "")
@@ -505,16 +509,42 @@ class Toolbox:
         if len(found) == 1:
             return found[0], f"(Asked the Supervisor context {found[0]}; the active context is {self.active}.)\n"
         if found:
+            sid = self._find_supervisor(self.active) if self.active else None
+            if sid:
+                return sid, f"(Asked the Supervisor context {sid}, the vSphere namespace that holds {self.active}.)\n"
             raise BadInput(f"Several Supervisor contexts: {', '.join(found)}. Give one as cluster.")
         raise BadInput("None of your contexts is a Supervisor, so the VMware side can't be seen from here. "
                        "The operator needs to log in to the Supervisor with kubectl and start ./ts again.")
 
-    def _find_supervisor(self):
-        """The one Supervisor among your contexts, or None."""
+    def _find_supervisor(self, workload=None):
+        """The Supervisor context that holds a workload cluster, or None.
+
+        With several (one per vSphere namespace), the one whose namespace has a VKS cluster with the workload
+        cluster's API address, else its name."""
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(self._role, self.clusters))
         found = [c for c in self.clusters if self.roles.get(c) == "supervisor"]
-        return found[0] if len(found) == 1 else None
+        if len(found) == 1:
+            return found[0]
+        if not found or not workload:
+            return None
+        want = self._cluster(workload)
+        host = urllib.parse.urlparse(want.api).hostname if want.api else ""
+        host = "" if host in (None, "127.0.0.1", "localhost") else host
+        names, by_name, seen = {want.id, want.context}, None, set()
+        for sid in found:
+            c = self.clusters[sid]
+            if (c.api or sid, c.namespace) in seen:
+                continue
+            seen.add((c.api or sid, c.namespace))
+            items, _ = self._vks_list(sid, VKS_KINDS["clusters"], None)
+            for it in items:
+                end = ((it.get("spec") or {}).get("controlPlaneEndpoint") or {}).get("host", "")
+                if host and end == host:
+                    return sid
+                if by_name is None and it["metadata"]["name"] in names:
+                    by_name = sid
+        return by_name
 
     def k8s_use_context(self, context):
         """Only for this chat: the kubeconfig and other terminals are not touched."""
@@ -676,11 +706,21 @@ class Toolbox:
         for _, problem in (clusters, vms, pvcs, pods):
             if problem.startswith("the login was refused"):
                 return f"KUBERNETES {cid}: {EXPIRED}"
-        text, now = [], time.time()
+        text, now, old = [], time.time(), 0
+        named = lambda o: {(v.get("persistentVolumeClaim") or {}).get("claimName")
+                           for v in (o.get("spec") or {}).get("volumes") or []}
+        used = set().union(*(named(o) for o in pods[0] + vms[0])) if pods[0] or vms[0] else set()
         for c in pvcs[0]:
             phase = (c.get("status") or {}).get("phase", "unknown")
-            if phase != "Bound":
-                text.append(f"- claim {c['metadata']['name']}: {phase}")
+            if phase == "Bound":
+                continue
+            cname = c["metadata"]["name"]
+            made = when(c["metadata"].get("creationTimestamp"))
+            if cname not in used and made and now - made > LEFTOVER:
+                old += 1  # nothing waits for it: left over, not a problem now
+                continue
+            text.append(f"- claim {cname} (in the vSphere namespace): {phase}"
+                        + ("" if cname in used else ", used by nothing"))
         for p in pods[0]:
             why = "" if self._leftover(p, now) else self._pod_trouble(p, now, recent=True)
             if why:
@@ -691,6 +731,8 @@ class Toolbox:
                 f"{len(pvcs[0])} claims" if not pvcs[1] else "claims hidden"]
         if pods[0]:
             said.append(f"{len(pods[0])} vSphere pods")
+        if old:
+            said.append(f"{old} old unused claim(s) not bound")
         return "\n".join([f"KUBERNETES {cid}: vSphere namespace {ns}: {', '.join(said)}; {len(text)} need a look"]
                          + text[:40])
 
@@ -1106,25 +1148,30 @@ class Toolbox:
         rows = []
         phase = (c.get("status") or {}).get("phase", "unknown")
         version = ((c.get("spec") or {}).get("topology") or {}).get("version", "")
-        for bad in ([f"phase {phase}"] if phase != "Provisioned" else []) + conditions(c):
+        # A pause is one setting on the cluster: said once in the heading, not on every part of it.
+        paused = bool((c.get("spec") or {}).get("paused")) or any(
+            x.get("type") == "Paused" and x.get("status") == "True"
+            for x in ((c.get("status") or {}).get("conditions") or []) + (((c.get("status") or {}).get("v1beta2") or {}).get("conditions") or []))
+        skip = ("Paused",) if paused else ()
+        for bad in ([f"phase {phase}"] if phase != "Provisioned" else []) + conditions(c, skip):
             rows.append(f"- cluster: {bad}")
         for o in mine("planes"):
             ready, want = count(o)
-            for bad in ([f"{ready} of {want} ready"] if ready != want else []) + conditions(o):
+            for bad in ([f"{ready} of {want} ready"] if ready != want else []) + conditions(o, skip):
                 rows.append(f"- control plane {o['metadata']['name']}: {bad}")
         for o in mine("pools"):
             ready, want = count(o)
-            for bad in ([f"{ready} of {want} ready"] if ready != want else []) + conditions(o):
+            for bad in ([f"{ready} of {want} ready"] if ready != want else []) + conditions(o, skip):
                 rows.append(f"- worker pool {o['metadata']['name']}: {bad}")
         machines = mine("machines")
         vms = {v["metadata"]["name"]: v for v in got["vms"][0] if v["metadata"].get("namespace") == ns}
         running = 0
         for m in machines:
             status, mname = m.get("status") or {}, m["metadata"]["name"]
-            bad = conditions(m)
-            if status.get("phase") == "Running" and not bad:
+            bad = conditions(m, skip)
+            if status.get("phase") == "Running":
                 running += 1
-            else:
+            if status.get("phase") != "Running" or bad:
                 node = (status.get("nodeRef") or {}).get("name") or "no node yet"
                 rows.append(f"- machine {mname} (node {node}): phase {status.get('phase', 'unknown')}"
                             + "".join(f"; {b}" for b in bad))
@@ -1135,11 +1182,11 @@ class Toolbox:
                 continue
             power = (vm.get("status") or {}).get("powerState", "unknown")
             wrong = ([f"power {power}"] if power.lower() != "poweredon" else []) \
-                + ([] if vm_address(vm) else ["no IP address"]) + conditions(vm)
+                + ([] if vm_address(vm) else ["no IP address"]) + conditions(vm, skip)
             if wrong:
                 rows.append(f"  - VM {vm['metadata']['name']}: " + "; ".join(wrong))
         head = f"VKS CLUSTER {ns}/{cname}" + (f" ({version})" if version else "") \
-            + f": {running} of {len(machines)} machines running; "
+            + f": {PAUSED + '; ' if paused else ''}{running} of {len(machines)} machines running; "
         return [head + (f"{len(rows)} need a look" if rows else "nothing wrong found")] + rows[:60]
 
     def _events_of(self, cid, ns, kind, obj):
@@ -1150,12 +1197,11 @@ class Toolbox:
     def vks_volume_check(self, cluster, pvc, namespace):
         """A volume from the pod down to VMware: the claim, the volume, the attach, and the Supervisor's side."""
         cid = self._cluster(cluster).id
-        sup = cid if self._role(cid) == "supervisor" else self._find_supervisor()
+        if self._role(cid) == "supervisor":  # a claim that lives in the vSphere namespace itself
+            return self._supervisor_claim(cid, self._ns1(cid, namespace), pvc) if pvc else self._volume_overview(None, cid)
+        sup = self._find_supervisor(cid)
         if not pvc:
-            return self._volume_overview(None if sup == cid else cid, sup)
-        if sup == cid:
-            raise BadInput("Give the workload cluster's context as cluster: the claim lives there. "
-                           "The Supervisor is found automatically.")
+            return self._volume_overview(cid, sup)
         ns = self._ns1(cid, namespace)
         claim, problem = self._json(cid, "persistentvolumeclaims", name(pvc, "pvc"), "-n", ns)
         if problem:
@@ -1193,9 +1239,49 @@ class Toolbox:
         if not users:
             text.append("No pod uses this claim.")
         if not sup:
-            return "\n".join(text + ["", "The VMware side can't be seen: none of your contexts is a Supervisor (or several are). "
-                                         "Log in to the Supervisor with kubectl and start ./ts again."])
+            return "\n".join(text + ["", "The VMware side can't be seen: no Supervisor context found that holds this "
+                                         "cluster. Log in to the vSphere namespace that holds it with kubectl vsphere login."])
         return "\n".join(text + ["", *self._volume_supervisor(sup, uid, handle)])
+
+    def _supervisor_claim(self, cid, ns, pvc):
+        """A claim made in a vSphere namespace itself: not a claim inside a workload cluster, even with the same name."""
+        claim, problem = self._json(cid, "persistentvolumeclaims", name(pvc, "pvc"), "-n", ns)
+        if problem:
+            return f"Could not read claim {ns}/{pvc} in context {cid}: {problem}"
+        spec, status, meta = claim.get("spec") or {}, claim.get("status") or {}, claim.get("metadata") or {}
+        phase = status.get("phase", "unknown")
+        age = time.time() - when(meta.get("creationTimestamp")) if when(meta.get("creationTimestamp")) else 0
+        size = (status.get("capacity") or {}).get("storage") or ((spec.get("resources") or {}).get("requests") or {}).get("storage", "?")
+        text = [f"SUPERVISOR CLAIM {ns}/{pvc} (context {cid}: a claim in the vSphere namespace itself, not one inside a "
+                f"workload cluster, even if one there has the same name): {phase}, {size}, storage class "
+                f"{spec.get('storageClassName', '?')}" + (f", made {ago(age)} ago" if age else "")]
+        pods, _ = self._vks_list(cid, "pods", ns)
+        vms, _ = self._vks_list(cid, VKS_KINDS["vms"], ns)
+        names = lambda o: [(v.get("persistentVolumeClaim") or {}).get("claimName") for v in (o.get("spec") or {}).get("volumes") or []]
+        users = [f"pod {p['metadata']['name']}" for p in pods if pvc in names(p)] \
+            + [f"VM {v['metadata']['name']}" for v in vms if pvc in names(v)]
+        text.append("Used by: " + (", ".join(users) if users else "nothing (no pod or VM in the namespace names it)"))
+        if phase != "Bound":
+            volume = spec.get("volumeName")
+            if volume:
+                text.append(f"- It asks for the volume {volume} by name (spec.volumeName). Such a claim binds only to that "
+                            f"volume, and stays Pending while it does not exist on the Supervisor or belongs to another claim.")
+                pv, why = self._json(cid, "persistentvolumes", name(volume, "volume"))
+                if "Forbidden" in why:
+                    text.append(f"  This login can't read volumes on the Supervisor, so whether {volume} exists there "
+                                f"can't be checked.")
+                elif "NotFound" in why or "not found" in why:
+                    text.append(f"  The volume {volume} does not exist on the Supervisor.")
+                elif pv:
+                    ref = ((pv.get("spec") or {}).get("claimRef") or {})
+                    text.append(f"  The volume {volume} is {(pv.get('status') or {}).get('phase', '?')}, held by claim "
+                                f"{ref.get('namespace', '?')}/{ref.get('name', '?')}.")
+            events = self._events_of(cid, ns, "PersistentVolumeClaim", pvc)
+            text += events or ["No events for it (events are usually kept about an hour, so an old claim has none)."]
+            if not users and age > LEFTOVER:
+                text.append(f"- Nothing uses it and it has been {phase} for {ago(age)}: most likely left over. "
+                            f"Deleting it is the operator's decision.")
+        return "\n".join(text + self._quota(cid, ns))
 
     def _volume_supervisor(self, sup, uid, handle):
         """The Supervisor's copy of a claim is named after the cluster and the claim's ID."""
@@ -1625,7 +1711,8 @@ class Toolbox:
               "node, and the Supervisor's side (its claim, the attach to the VM, storage limits), with VMware's error. "
               "Use for a claim stuck Pending or a pod stuck on attach or mount errors. Without pvc: every volume problem.",
               "Checked volume {pvc}", self.vks_volume_check,
-              {"pvc": P("string", "Claim (PVC) name in the workload cluster (default: all problems)"), "namespace": ns1},
+              {"pvc": P("string", "Claim (PVC) name: in the workload cluster, or in a vSphere namespace when cluster is "
+                                  "that namespace's Supervisor context (default: all problems)"), "namespace": ns1},
               needs_kube=True),
             t("host_status", "Load, memory, swap and disks of the machine running this tool, not of cluster nodes.", "Read host status", self.host_status),
             t("host_processes", "Top host processes.", "Read top host processes", self.host_processes,

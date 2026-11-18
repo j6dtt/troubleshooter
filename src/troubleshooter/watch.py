@@ -137,6 +137,8 @@ def kube_survey(box):
         if lines and lines[-1]["kind"] == "Kubernetes":
             lines[-1]["role"] = kinds[cid]
             lines[-1]["expired"] = part.splitlines()[0].endswith(EXPIRED)
+            # a namespace where this login sees nothing: not healthy, just unknown
+            lines[-1]["blind"] = all(w in part.splitlines()[0] for w in ("VKS clusters hidden", "VMs hidden", "claims hidden"))
     seen = set()
     for cid in ids:
         if box.roles.get(cid) != "supervisor":
@@ -155,7 +157,8 @@ def kube_survey(box):
                 elif row.lstrip().startswith("- ") and cluster:
                     found[key(f"vks {cid} {cluster}", row)] = f"VKS cluster {cluster}: {row.strip()[2:]}"
                     count[cluster][1] += 1
-            lines += [{"kind": "VKS cluster", "where": name, "line": text, "problems": n, "role": "vks", "context": cid}
+            lines += [{"kind": "VKS cluster", "where": name, "line": text, "problems": n, "role": "vks", "context": cid,
+                       "paused": text.startswith("paused")}
                       for name, (text, n) in count.items() if not any(x["where"] == name for x in lines)]
         except Exception:
             pass

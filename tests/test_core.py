@@ -738,7 +738,7 @@ class VksVolumes(unittest.TestCase):
         box = tools.Toolbox(Settings(), clusters={"work": tools.Cluster("work", "", "work")})
         out = box.vks_volume_check(None, "data", "shop")
         self.assertIn("CLAIM shop/data", out)
-        self.assertIn("none of your contexts is a Supervisor", out)
+        self.assertIn("no Supervisor context found that holds this cluster", out)
 
     def test_overview_lists_only_problems(self):
         self.claim(attached=False)
@@ -753,9 +753,53 @@ class VksVolumes(unittest.TestCase):
         self.assertIn(f"- team-a/w-1-{self.HANDLE} not attached to its VM: disk is locked by another VM", out)
         self.assertNotIn("shop/data:", out)
 
-    def test_claim_must_be_asked_from_the_workload_cluster(self):
-        with self.assertRaises(tools.BadInput):
-            self.box.vks_volume_check("super", "data", "shop")
+    def test_a_claim_in_the_vsphere_namespace_is_read_there(self):
+        """The same name can live in the vSphere namespace and inside a workload cluster: they are not the same."""
+        self.sup["persistentvolumeclaims shopdb -n team-a"] = {
+            "metadata": {"name": "shopdb", "namespace": "team-a", "creationTimestamp": stamp(98 * 86400)},
+            "spec": {"volumeName": "shopdb-pv", "storageClassName": "vks-sp"}, "status": {"phase": "Pending"}}
+        self.sup["persistentvolumes shopdb-pv"] = "Error from server (Forbidden): persistentvolumes is forbidden"
+        self.sup["pods -n team-a"] = {"items": []}
+        self.sup["virtualmachines.vmoperator.vmware.com -n team-a"] = {"items": []}
+        self.sup["events"] = "LAST SEEN TYPE REASON"
+        first = ("persistentvolumeclaims shopdb -n team-a", "pods -n team-a", "virtualmachines.vmoperator.vmware.com -n team-a")
+        self.sup = {**{k: self.sup[k] for k in first}, **{k: v for k, v in self.sup.items() if k not in first}}
+        real = self.kubectl
+
+        def forbid(argv, timeout=30, parsed=False):
+            if "persistentvolumes" in argv and "shopdb-pv" in argv:
+                return reply(False, "Error from server (Forbidden): persistentvolumes is forbidden")
+            return real(argv, timeout, parsed)
+        with mock.patch.object(tools, "run", forbid):
+            out = self.box.vks_volume_check("super", "shopdb", None)
+        for line in ("SUPERVISOR CLAIM team-a/shopdb (context super: a claim in the vSphere namespace itself",
+                     "Pending", "storage class vks-sp", "made 98 days ago", "Used by: nothing",
+                     "- It asks for the volume shopdb-pv by name", "can't read volumes on the Supervisor",
+                     "No events for it", "most likely left over"):
+            self.assertIn(line, out)
+
+    def test_with_several_supervisors_the_one_holding_the_cluster_is_used(self):
+        self.box = tools.Toolbox(Settings(), clusters={
+            "work": tools.Cluster("work", "", "work", api="https://10.9.9.9:6443"),
+            "super": tools.Cluster("super", "", "super", namespace="team-a", api="https://sup"),
+            "other": tools.Cluster("other", "", "other", namespace="team-b", api="https://sup")})
+        real = self.kubectl
+
+        def two(argv, timeout=30, parsed=False):
+            ctx = argv[argv.index("--context") + 1]
+            if "/apis/cluster.x-k8s.io" in argv:
+                return reply(ctx != "work", "{}" if ctx != "work" else "Error from server (NotFound): not found")
+            if "clusters.cluster.x-k8s.io" in argv:
+                host = "10.9.9.9" if ctx == "super" else "10.1.1.1"
+                return reply(True, json.dumps({"items": [{"metadata": {"name": "c-" + ctx, "namespace": "x"},
+                                                          "spec": {"controlPlaneEndpoint": {"host": host}}}]}))
+            return real(argv if ctx != "other" else argv, timeout, parsed)
+        with mock.patch.object(tools, "run", two):
+            self.assertEqual(self.box._find_supervisor("work"), "super")
+            out = self.box.vks_volume_check("work", "data", "shop")
+        self.assertIn(f"SUPERVISOR context super, namespace team-a: claim {self.HANDLE} is Bound", out)
+
+    def test_a_bad_claim_name_is_refused(self):
         with self.assertRaises(tools.BadInput):
             self.box.vks_volume_check("work", "a;b", "shop")
 
@@ -1660,7 +1704,8 @@ class Page(unittest.TestCase):
         self.assertEqual(state["problems"][0]["lane"], self.site.health.box.here)
         self.assertEqual(state["hosts"][0]["name"], self.site.health.box.here)
         self.assertEqual(state["clusters"], [{"name": "vks-a", "kind": "Kubernetes", "line": "3 nodes", "problems": 0,
-                                              "role": "", "expired": False, "context": ""}])
+                                              "role": "", "expired": False, "paused": False, "blind": False,
+                                              "context": ""}])
 
     def test_a_host_that_cannot_say_is_shown_with_the_reason(self):
         patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02", "host-03"), kube_dir="/none", log_dir=self.s.log_dir)
@@ -2204,7 +2249,8 @@ class VsphereScope(unittest.TestCase):
         self.assertIn("2 VKS cluster(s) (other, prod1)", ns["line"])
         self.assertIn("3 VMs", ns["line"])
         self.assertEqual(ns["problems"], 1)  # the claim that is not bound; Forbidden is never one
-        self.assertEqual([v for v in got["problems"].values() if "claim" in v], ["kubernetes team-a: claim data-2: Pending"])
+        self.assertEqual([v for v in got["problems"].values() if "claim" in v],
+                         ["kubernetes team-a: claim data-2 (in the vSphere namespace): Pending, used by nothing"])
         self.assertNotIn("team-a-again", cards)  # the same namespace through a second context: one card
         self.assertEqual(cards["team-a/prod1"]["role"], "vks")
         self.assertEqual(cards["team-a/prod1"]["context"], "team-a")
@@ -2229,6 +2275,34 @@ class VsphereScope(unittest.TestCase):
         # a tool, asked about the pod, still says it
         self.assertIn("restarted 9 times, last 40 days ago", tools.Toolbox._pod_trouble(pod("old-restarts", restarts=9, ended=stamp(40 * 86400))))
 
+    def test_an_old_unused_claim_is_left_over_not_a_problem(self):
+        real = self.kubectl
+
+        def old(argv, timeout=30, parsed=False):
+            if "persistentvolumeclaims" in argv and "--context" in argv and argv[argv.index("--context") + 1] != "prod1":
+                return reply(True, json.dumps({"items": [
+                    vks_item("left", spec={"volumeName": "gone"}, status={"phase": "Pending"}) | {
+                        "metadata": {"name": "left", "namespace": "team-a", "creationTimestamp": stamp(98 * 86400)}}]}))
+            return real(argv, timeout, parsed)
+        self.kubectl = old
+        with mock.patch.object(tools, "run", old):
+            got, cards = self.survey()
+        self.assertEqual(cards["team-a"]["problems"], 0)
+        self.assertIn("1 old unused claim(s) not bound", cards["team-a"]["line"])
+
+    def test_a_namespace_this_login_cannot_see_is_not_called_healthy(self):
+        real = self.kubectl
+
+        def blind(argv, timeout=30, parsed=False):
+            ctx = argv[argv.index("--context") + 1]
+            if ctx.startswith("team-a") and "get" in argv and "--raw" not in argv and "events" not in argv:
+                return reply(False, "Error from server (Forbidden): forbidden")
+            return real(argv, timeout, parsed)
+        with mock.patch.object(tools, "run", blind):
+            got, cards = self.survey()
+        self.assertTrue(cards["team-a"]["blind"])
+        self.assertFalse(cards["prod1"]["blind"])
+
     def test_an_expired_login_is_said_not_counted(self):
         self.expired = {"team-a", "team-a-again", "prod1"}
         self.box.roles.pop("prod1", None)
@@ -2238,6 +2312,35 @@ class VsphereScope(unittest.TestCase):
         self.assertTrue(cards["team-a"]["expired"])
         self.assertEqual(cards["team-a"]["problems"], 0)
         self.assertFalse(any(k.startswith(("KUBERNETES prod1", "KUBERNETES team-a")) for k in got["problems"]))
+
+
+class PausedVks(unittest.TestCase):
+    """A paused VKS cluster runs fine: VMware just stops managing it. Said once, never per part."""
+
+    def got(self, paused):
+        cond = [{"type": "Paused", "status": "True" if paused else "False", "reason": "Paused" if paused else "NotPaused"},
+                {"type": "Updating", "status": "False", "reason": "NotUpdating"}]
+        machine = vks_item("dev-cp-1", OF, {"clusterName": "prod1"}, {"phase": "Running", "nodeRef": {"name": "dev-cp-1"},
+                                                                         "v1beta2": {"conditions": cond}})
+        return {"clusters": ([], ""), "planes": ([vks_item("prod1-cp", OF, {"replicas": 1}, {"readyReplicas": 1, "conditions": cond})], ""),
+                "pools": ([vks_item("prod1-pool", OF, {"replicas": 1}, {"readyReplicas": 1, "conditions": cond})], ""),
+                "machines": ([machine], ""),
+                "vms": ([vks_item("dev-cp-1", status={"powerState": "PoweredOn", "vmIp": "10.0.0.7"})], "")}
+
+    def cluster(self, paused):
+        return vks_item("prod1", spec={"paused": paused}, status={"phase": "Provisioned", "conditions": [
+            {"type": "Paused", "status": "True" if paused else "False"}]})
+
+    def test_paused_is_said_once_and_machines_still_count(self):
+        rows = tools.Toolbox._vks_cluster(self.cluster(True), self.got(True))
+        self.assertTrue(rows[0].startswith("VKS CLUSTER team-a/prod1: paused: VMware won't repair"), rows[0])
+        self.assertIn("1 of 1 machines running; nothing wrong found", rows[0])
+        self.assertEqual(rows[1:], [])
+
+    def test_updating_false_is_normal(self):
+        rows = tools.Toolbox._vks_cluster(self.cluster(False), self.got(False))
+        self.assertEqual(rows, ["VKS CLUSTER team-a/prod1: 1 of 1 machines running; nothing wrong found"])
+        self.assertEqual(tools.conditions({"status": {"conditions": [{"type": "Updating", "status": "True"}]}}), ["Updating=True"])
 
 
 class KubeHome(unittest.TestCase):
