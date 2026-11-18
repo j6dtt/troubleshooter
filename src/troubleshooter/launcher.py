@@ -408,7 +408,8 @@ def user(args):
             return 1
         salt = secrets.token_hex(16)
         done = hashlib.pbkdf2_hmac("sha256", first.encode("utf-8"), bytes.fromhex(salt), ROUNDS)
-        users[name] = "pbkdf2${}${}${}".format(ROUNDS, salt, done.hex())
+        # Dots, not "$": Docker Compose reads "$" in .env as the start of a variable.
+        users[name] = "pbkdf2.{}.{}.{}".format(ROUNDS, salt, done.hex())
     try:
         env_set("WEB_USERS", ",".join("{}:{}".format(n, h) for n, h in sorted(users.items())))
     except OSError as e:

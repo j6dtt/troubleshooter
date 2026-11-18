@@ -446,6 +446,11 @@ def check_hosts(settings, box, report):
         except hosts.Unreachable as e:
             report(f"Agent {host}", False, str(e))
     count = sum(":" in u for u in settings.web_users.split(","))
+    from . import web
+    for name, stored in web.users(settings).items():
+        if not web.account_whole(stored):
+            report(f"Page account {name}", False, "its password was cut short in .env; add it again: "
+                                                  f"./ts user add {name}, then docker compose up -d")
     try:
         socket.create_connection(("127.0.0.1", settings.web_port), timeout=3).close()
         report("Web page", count > 0, f"https://{socket.gethostname()}:{settings.web_port}, {count} account(s)"

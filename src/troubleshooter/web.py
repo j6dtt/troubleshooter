@@ -39,9 +39,16 @@ def users(settings):
     return dict(u.split(":", 1) for u in settings.web_users.split(",") if ":" in u)
 
 
+def account_whole(stored):
+    """False when a password hash was cut short. Older ./ts wrote it with "$", and Docker Compose read
+    "$" plus letters in .env as a variable, so part of the hash went missing."""
+    parts = re.split(r"[$.]", stored or "")
+    return len(parts) == 4 and parts[0] == "pbkdf2" and len(parts[2]) == 32 and len(parts[3]) == 64
+
+
 def password_ok(stored, given):
     try:
-        kind, rounds, salt, want = stored.split("$")
+        kind, rounds, salt, want = re.split(r"[$.]", stored)
         if kind != "pbkdf2":
             return False
         got = hashlib.pbkdf2_hmac("sha256", given.encode("utf-8"), bytes.fromhex(salt), int(rounds))

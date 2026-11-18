@@ -1,6 +1,7 @@
 """python -m unittest discover tests  (no network, no Docker needed)"""
 import dataclasses
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -1523,6 +1524,23 @@ class Page(unittest.TestCase):
         os.makedirs(os.path.join(self.s.runbook_dir, "host-01"))
         self.logged = []
         self.site = web.Site(self.s, self.logged.append)
+
+    def test_a_hash_written_by_user_add_survives_docker_compose(self):
+        """Compose reads "$ab12" in .env as a variable: ./ts user add writes dots, and old "$" hashes still work."""
+        salt = "ab" * 16
+        digest = hashlib.pbkdf2_hmac("sha256", b"right password", bytes.fromhex(salt), 1000).hex()
+        self.assertTrue(web.password_ok(f"pbkdf2.1000.{salt}.{digest}", "right password"))
+        self.assertTrue(web.password_ok(f"pbkdf2$1000${salt}${digest}", "right password"))
+        self.assertTrue(web.account_whole(f"pbkdf2.1000.{salt}.{digest}"))
+        self.assertFalse(web.account_whole(f"pbkdf2$1000$${digest}"))  # what Compose left of it
+        env = os.path.join(tempfile.mkdtemp(), ".env")
+        with mock.patch.object(launcher, "ENV", env), mock.patch.object(launcher.getpass, "getpass", lambda prompt: "a-long-password"), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(launcher.user(["user", "add", "carol"]), 0)
+        with open(env) as f:
+            row = f.read().strip()
+        self.assertNotIn("$", row)
+        self.assertTrue(web.password_ok(row.split(":", 1)[1], "a-long-password"))
 
     def test_sign_in_and_lockout(self):
         token, why = self.site.sign_in("alice", "right password", "10.0.0.5")
