@@ -1737,7 +1737,7 @@ class Page(unittest.TestCase):
         self.assertEqual(state["hosts"][0]["name"], self.site.health.box.here)
         self.assertEqual(state["clusters"], [{"name": "vks-a", "kind": "Kubernetes", "line": "3 nodes", "problems": 0,
                                               "role": "", "expired": False, "paused": False, "blind": False,
-                                              "context": ""}])
+                                              "context": "", "spaces": [], "more_spaces": 0}])
 
     def test_a_host_that_cannot_say_is_shown_with_the_reason(self):
         patch, s = on("host-01", hub_host="host-01", agent_hosts=("host-02", "host-03"), kube_dir="/none", log_dir=self.s.log_dir)
@@ -2351,6 +2351,18 @@ class VsphereScope(unittest.TestCase):
         for argv in asked:
             self.assertNotIn("--all-namespaces", argv)
             self.assertEqual(argv[argv.index("-n") + 1], "team-a")
+
+    def test_a_cluster_card_counts_pods_per_namespace(self):
+        part = self.box._k8s_summary("prod1")
+        row = next(r for r in part.splitlines() if r.startswith("NAMESPACES "))
+        spaces, more = tools.read_namespace_line(row)
+        self.assertEqual(sum(s["pods"] for s in spaces), 5)  # every pod, the left-over ones too
+        self.assertEqual(more, 0)
+        self.assertTrue(spaces[0]["problems"])  # the namespace with trouble comes first
+        found = watch.kube_survey(self.box)
+        card = next(x for x in found["lines"] if x.get("where") == "prod1")
+        self.assertEqual(card["spaces"], spaces)
+        self.assertFalse(any("NAMESPACES" in k for k in found["problems"]))  # a count, never a problem
 
     def test_deep_check_runs_every_tool_on_every_login(self):
         said = []

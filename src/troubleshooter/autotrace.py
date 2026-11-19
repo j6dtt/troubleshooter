@@ -293,7 +293,8 @@ class Health:
                     "clusters": [{"name": c["where"], "kind": c["kind"], "line": c["line"], "problems": c["problems"],
                                   "role": c.get("role", ""), "expired": c.get("expired", False),
                                   "paused": c.get("paused", False), "blind": c.get("blind", False),
-                                  "context": c.get("context", "")}
+                                  "context": c.get("context", ""), "spaces": c.get("spaces", []),
+                                  "more_spaces": c.get("more_spaces", 0)}
                                  for c in self.lines if c["kind"] in ("Kubernetes", "VKS cluster")]}
 
     def problem_events(self, since):

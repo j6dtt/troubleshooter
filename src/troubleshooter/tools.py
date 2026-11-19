@@ -287,6 +287,27 @@ def conditions(obj, skip=()):
 
 
 RECENT_UNPAUSE = 7 * 86400
+SPACES_SHOWN = 12
+
+
+def namespace_line(spaces, hurt):
+    """"NAMESPACES shop 3 (1 needs a look), default 42, …": those with problems first, then the biggest."""
+    order = sorted(spaces, key=lambda n: (-hurt.get(n, 0), -spaces[n], n))
+    parts = [f"{n} {spaces[n]}" + (f" ({hurt[n]} need{'s' if hurt[n] == 1 else ''} a look)" if hurt.get(n) else "")
+             for n in order[:SPACES_SHOWN]]
+    more = len(order) - SPACES_SHOWN
+    return "NAMESPACES " + ", ".join(parts) + (f", and {more} more" if more > 0 else "")
+
+
+SPACE = re.compile(r"([\w.-]+) (\d+)(?: \((\d+) needs? a look\))?(?:, |$)")
+
+
+def read_namespace_line(row):
+    """The page's form of namespace_line: [{"name", "pods", "problems"}], plus "more"."""
+    found = [{"name": m[1], "pods": int(m[2]), "problems": int(m[3] or 0)}
+             for m in SPACE.finditer(row[len("NAMESPACES "):].split(", and ")[0])]
+    more = re.search(r", and (\d+) more$", row)
+    return found, int(more[1]) if more else 0
 
 
 def pause_field(obj):
@@ -719,16 +740,20 @@ class Toolbox:
             seen = "pods hidden (no permission)" if "Forbidden" in pods.text else f"pods not read: {kube_error(pods.text)}"
             return "\n".join([f"KUBERNETES {cid}: {count}, {seen}; {len(text)} need a look"] + text[:40])
         items, now, old = json.loads(pods.text)["items"], time.time(), 0
+        spaces, hurt = {}, {}
         for p in items:
+            pns = p["metadata"].get("namespace", "?")
+            spaces[pns] = spaces.get(pns, 0) + 1
             if self._leftover(p, now):
                 old += 1
                 continue
             why = self._pod_trouble(p, now, recent=True)
             if why:
-                text.append(f"- pod {p['metadata']['namespace']}/{p['metadata']['name']}: {why}")
+                hurt[pns] = hurt.get(pns, 0) + 1
+                text.append(f"- pod {pns}/{p['metadata']['name']}: {why}")
         leftovers = f", {old} old failed pod(s) left over" if old else ""
         return "\n".join([f"KUBERNETES {cid}: {count}, {len(items)} pods in {scope}{leftovers}; "
-                          f"{len(text)} need a look"] + text[:40])
+                          f"{len(text)} need a look"] + ([namespace_line(spaces, hurt)] if spaces else []) + text[:40])
 
     def _namespace_summary(self, cid):
         """A vSphere namespace on a Supervisor: what lives in it. Its VKS clusters get their own cards; here they

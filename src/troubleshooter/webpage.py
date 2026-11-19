@@ -359,6 +359,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
 .cards .card.stale{border-color:var(--warn);border-style:dashed}
 .cards .card.flash{box-shadow:0 0 0 2px var(--cyan)}
 .cardlinks{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.spaces{display:flex;flex-wrap:wrap;gap:2px 10px;margin-top:4px}
 .cardlinks button{min-height:32px;padding:0 10px;border-radius:6px;color:var(--cyan-text);font-size:13px}
 .cards .head{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
 .cards .name{font-weight:700;font-size:16px;overflow-wrap:anywhere}
@@ -922,6 +923,17 @@ JS = r'''"use strict";
       card.appendChild(head);
       var line = c.expired ? "run kubectl vsphere login again" : c.line.replace(/^vSphere namespace [^:]+: /, "");
       card.appendChild(el("span", "muted small", (ROLE[c.role] || c.kind) + " · " + line));
+      if (c.spaces && c.spaces.length) {  // pods per namespace: where they are, and where the trouble is
+        var sp = el("div", "spaces small");
+        sp.setAttribute("aria-label", "Pods per namespace");
+        c.spaces.forEach(function (s) {
+          var t = el("span", s.problems ? "warn" : "muted", s.name + " " + s.pods + (s.problems ? " ▲" + s.problems : ""));
+          t.title = s.pods + " pods in namespace " + s.name + (s.problems ? ", " + s.problems + " need a look" : "");
+          sp.appendChild(t);
+        });
+        if (c.more_spaces) sp.appendChild(el("span", "muted", "+" + c.more_spaces + " more"));
+        card.appendChild(sp);
+      }
       if (c.role === "namespace") {  // its VKS clusters, each with its own card
         linkRow(card, "VKS clusters:", h.clusters.filter(function (x) { return x.role === "vks" && x.context === c.name; })
           .map(function (x) { return { label: x.name.split("/").pop(), target: x.name }; }));

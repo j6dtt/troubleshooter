@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from . import history, hosts
-from .tools import EXPIRED
+from .tools import EXPIRED, read_namespace_line
 
 EVERY = 60       # seconds between rounds; ./ts watch --every N changes it
 SHORTEST = 15
@@ -138,6 +138,10 @@ def kube_survey(box):
             lines[-1]["role"] = kinds[cid]
             lines[-1]["expired"] = part.splitlines()[0].endswith(EXPIRED)
             # a namespace where this login sees nothing: not healthy, just unknown
+            rows = part.splitlines()
+            spaces = next((r for r in rows[1:] if r.startswith("NAMESPACES ")), "")
+            if spaces:
+                lines[-1]["spaces"], lines[-1]["more_spaces"] = read_namespace_line(spaces)
             lines[-1]["blind"] = all(w in part.splitlines()[0] for w in ("VKS clusters hidden", "VMs hidden", "claims hidden"))
     seen = set()
     for cid in ids:
