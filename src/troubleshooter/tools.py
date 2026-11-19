@@ -286,6 +286,17 @@ def conditions(obj, skip=()):
     return list(found.values())
 
 
+RECENT_UNPAUSE = 7 * 86400
+
+
+def pause_field(obj):
+    """(manager, time in seconds or None) of whoever last wrote spec.paused, from the managed fields; (None, None)."""
+    for f in (obj.get("metadata") or {}).get("managedFields") or []:
+        if "f:paused" in ((f.get("fieldsV1") or {}).get("f:spec") or {}):
+            return f.get("manager") or "unknown tool", when(f.get("time"))
+    return None, None
+
+
 def paused_by(obj):
     """Who last set spec.paused, from the object's managed fields: "kubectl-patch, 2026-08-10 14:02 UTC", or ""."""
     for f in (obj.get("metadata") or {}).get("managedFields") or []:
@@ -1218,6 +1229,13 @@ class Toolbox:
         if paused:
             who = paused_by(c)
             pause = PAUSED + (f" (set by {who})" if who else "") + "; "
+        else:
+            # spec.paused written, now false: someone unpaused it. Said for a week, so a trace can tie it in.
+            who, at = pause_field(c)
+            if who and at and time.time() - at < RECENT_UNPAUSE:
+                stamp = datetime.datetime.fromtimestamp(at, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                pause = f"unpaused: spec.paused set to false by {who} (its last change {stamp}), " \
+                        "so VMware repairs, scales and upgrades it again; "
         head = f"VKS CLUSTER {ns}/{cname}" + (f" ({version})" if version else "") \
             + f": {pause}{running} of {len(machines)} machines running; "
         return [head + (f"{len(rows)} need a look" if rows else "nothing wrong found")] + rows[:60]

@@ -2429,6 +2429,25 @@ class PausedVks(unittest.TestCase):
         self.assertIn("unpaused (set by kubectl-patch, its last change 2026-08-10 14:02 UTC);", rows[0])
         self.assertEqual(tools.paused_by(self.cluster(True)), "")
 
+    def test_a_recent_unpause_is_said_with_who_and_when(self):
+        """After an unpause the change is on the cluster itself: a trace can tie it in for a week."""
+        c = self.cluster(False)
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3 * 3600))
+        c["metadata"]["managedFields"] = [{"manager": "kubectl-patch", "operation": "Update", "time": recent,
+                                           "fieldsV1": {"f:spec": {"f:paused": {}}}}]
+        rows = tools.Toolbox._vks_cluster(c, self.got(False))
+        self.assertIn(f"unpaused: spec.paused set to false by kubectl-patch (its last change {recent[:10]} ", rows[0])
+        self.assertIn("1 of 1 machines running; nothing wrong found", rows[0])
+        c["metadata"]["managedFields"][0]["time"] = "2026-01-01T00:00:00Z"  # long ago: not news any more
+        self.assertNotIn("unpaused", tools.Toolbox._vks_cluster(c, self.got(False))[0])
+
+    def test_the_record_keeps_the_pause_so_what_changed_shows_it(self):
+        old = {"k8s": {"team-a": {"vks": {"cluster team-a/prod1": "Provisioned v1.33.6 paused"}}}}
+        new = {"k8s": {"team-a": {"vks": {"cluster team-a/prod1": "Provisioned v1.33.6"}}}}
+        text = "\n".join(history.differences(old, new))
+        self.assertIn("prod1", text)
+        self.assertIn("paused", text)
+
     def test_updating_false_is_normal(self):
         rows = tools.Toolbox._vks_cluster(self.cluster(False), self.got(False))
         self.assertEqual(rows, ["VKS CLUSTER team-a/prod1: 1 of 1 machines running; nothing wrong found"])

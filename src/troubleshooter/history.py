@@ -123,8 +123,9 @@ def _kube(box, cid):
     if box._role(cid) == "supervisor":  # VMware VKS: the clusters this Supervisor manages, and their VMs
         vks = {}
         for word, key, read in (
-                ("cluster", "clusters", lambda o: f"{(o.get('status') or {}).get('phase')} "
-                                                  f"{((o.get('spec') or {}).get('topology') or {}).get('version') or ''}".strip()),
+                ("cluster", "clusters", lambda o: (f"{(o.get('status') or {}).get('phase')} "
+                                                   f"{((o.get('spec') or {}).get('topology') or {}).get('version') or ''}".strip()
+                                                   + (" paused" if (o.get("spec") or {}).get("paused") else ""))),
                 ("machine", "machines", lambda o: (o.get("status") or {}).get("phase")),
                 ("VM", "vms", lambda o: (o.get("status") or {}).get("powerState"))):
             for o in _items(box, cid, VKS_KINDS[key]) or []:
