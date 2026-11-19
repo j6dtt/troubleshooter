@@ -2337,6 +2337,30 @@ class PausedVks(unittest.TestCase):
         self.assertIn("1 of 1 machines running; nothing wrong found", rows[0])
         self.assertEqual(rows[1:], [])
 
+    def test_what_the_pause_causes_is_not_said_again(self):
+        c = self.cluster(True)
+        c["status"]["conditions"] += [{"type": "TopologyReconciled", "status": "False", "reason": "Paused",
+                                       "message": "Cluster spec.paused is set to true"},
+                                      {"type": "UpdatesAvailable", "status": "False", "reason": "AlreadyUpToDate"}]
+        rows = tools.Toolbox._vks_cluster(c, self.got(True))
+        self.assertEqual(rows[1:], [])
+        c = self.cluster(False)
+        c["status"]["conditions"] += [{"type": "UpdatesAvailable", "status": "False", "reason": "AlreadyUpToDate"},
+                                      {"type": "Available", "status": "False", "reason": "NotAvailable"}]
+        rows = tools.Toolbox._vks_cluster(c, self.got(False))
+        self.assertEqual(rows[1:], ["- cluster: Available=False (NotAvailable)"])  # a real one still shows
+
+    def test_who_paused_it_and_when(self):
+        c = self.cluster(True)
+        c["metadata"]["managedFields"] = [
+            {"manager": "capi-controller", "operation": "Update", "time": "2026-11-01T01:00:00Z",
+             "fieldsV1": {"f:status": {"f:phase": {}}}},
+            {"manager": "kubectl-patch", "operation": "Update", "time": "2026-08-10T14:02:33Z",
+             "fieldsV1": {"f:spec": {"f:paused": {}}}}]
+        rows = tools.Toolbox._vks_cluster(c, self.got(True))
+        self.assertIn("unpaused (set by kubectl-patch, its last change 2026-08-10 14:02 UTC);", rows[0])
+        self.assertEqual(tools.paused_by(self.cluster(True)), "")
+
     def test_updating_false_is_normal(self):
         rows = tools.Toolbox._vks_cluster(self.cluster(False), self.got(False))
         self.assertEqual(rows, ["VKS CLUSTER team-a/prod1: 1 of 1 machines running; nothing wrong found"])

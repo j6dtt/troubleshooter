@@ -90,6 +90,7 @@ VKS_KINDS = {"clusters": "clusters." + CAPI, "planes": "kubeadmcontrolplanes.con
              "vms": "virtualmachines.vmoperator.vmware.com"}
 CLUSTER_LABEL = CAPI + "/cluster-name"
 BUSY = {"Deleting", "Paused", "Remediating", "RollingOut", "ScalingUp", "ScalingDown", "Stalled", "Updating"}  # True = worth saying
+INFO = {"UpdatesAvailable"}  # says something, never that anything is wrong (False = already up to date)
 PAUSED = "paused: VMware won't repair, scale or upgrade it until it is unpaused"
 SECRET_FILE = re.compile(r"(^|/)(\.env[^/]*|.*\.(key|pem|p12|pfx|jks|keystore|kdbx)|id_(rsa|dsa|ecdsa|ed25519)|"
                          r"shadow|gshadow|credentials?(\.\w+)?|\.netrc|\.pgpass|kubeconfig|client\.config)$", re.I)
@@ -272,12 +273,25 @@ def conditions(obj, skip=()):
     found = {}
     for c in (status.get("conditions") or []) + ((status.get("v1beta2") or {}).get("conditions") or []):
         kind, state = c.get("type", "?"), c.get("status")
-        if kind in skip:
+        if kind in skip or kind in INFO:
+            continue
+        # On a paused cluster, conditions that are only False because of the pause say nothing new.
+        if "Paused" in skip and (c.get("reason") == "Paused" or "spec.paused" in (c.get("message") or "")):
             continue
         if (state == "True") == (kind in BUSY) and kind not in found:
             why = " ".join(x for x in (c.get("reason"), (c.get("message") or "").strip()) if x)
             found[kind] = f"{kind}={state}" + (f" ({why[:300]})" if why else "")
     return list(found.values())
+
+
+def paused_by(obj):
+    """Who last set spec.paused, from the object's managed fields: "kubectl-patch, 2026-08-10 14:02 UTC", or ""."""
+    for f in (obj.get("metadata") or {}).get("managedFields") or []:
+        if "f:paused" in ((f.get("fieldsV1") or {}).get("f:spec") or {}):
+            stamp = str(f.get("time") or "").replace("T", " ").replace("Z", " UTC")
+            # the time is that tool's last change to the object, which is the pause unless it changed more since
+            return (f.get("manager") or "unknown tool") + (f", its last change {stamp[:16]} UTC" if stamp else "")
+    return ""
 
 
 def vm_address(vm):
@@ -1091,11 +1105,11 @@ class Toolbox:
         return history.what_changed(self, min(int(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]], 7 * 86400))
 
     # ---------- VMware VKS, seen from the Supervisor ----------
-    def _vks_list(self, cid, kind, namespace):
+    def _vks_list(self, cid, kind, namespace, *extra):
         """(items, problem). Without the right to list everywhere, falls back to the context's own namespace."""
-        r = run(self._kubectl(cid, "get", kind, "-o", "json", *self._ns(namespace)), parsed=True)
+        r = run(self._kubectl(cid, "get", kind, "-o", "json", *extra, *self._ns(namespace)), parsed=True)
         if not r.ok and "Forbidden" in r.text and not namespace and self._cluster(cid).namespace:
-            r = run(self._kubectl(cid, "get", kind, "-o", "json", "-n", self._ns1(cid, None)), parsed=True)
+            r = run(self._kubectl(cid, "get", kind, "-o", "json", *extra, "-n", self._ns1(cid, None)), parsed=True)
         if not r.ok:
             return [], kube_error(r.text)
         try:
@@ -1108,7 +1122,10 @@ class Toolbox:
         if name_:
             name(name_, "cluster name")
         with ThreadPoolExecutor(max_workers=5) as pool:
-            got = dict(zip(VKS_KINDS, pool.map(lambda k: self._vks_list(cid, k, namespace), VKS_KINDS.values())))
+            # managed fields of clusters only: they say who paused one, and when
+            got = dict(zip(VKS_KINDS, pool.map(
+                lambda k: self._vks_list(cid, k, namespace, *(["--show-managed-fields"] if k == VKS_KINDS["clusters"] else [])),
+                VKS_KINDS.values())))
         clusters, problem = got["clusters"]
         if problem:
             return note + f"Could not list VKS clusters in context {cid}: {problem}"
@@ -1185,8 +1202,12 @@ class Toolbox:
                 + ([] if vm_address(vm) else ["no IP address"]) + conditions(vm, skip)
             if wrong:
                 rows.append(f"  - VM {vm['metadata']['name']}: " + "; ".join(wrong))
+        pause = ""
+        if paused:
+            who = paused_by(c)
+            pause = PAUSED + (f" (set by {who})" if who else "") + "; "
         head = f"VKS CLUSTER {ns}/{cname}" + (f" ({version})" if version else "") \
-            + f": {PAUSED + '; ' if paused else ''}{running} of {len(machines)} machines running; "
+            + f": {pause}{running} of {len(machines)} machines running; "
         return [head + (f"{len(rows)} need a look" if rows else "nothing wrong found")] + rows[:60]
 
     def _events_of(self, cid, ns, kind, obj):
