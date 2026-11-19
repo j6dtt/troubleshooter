@@ -514,19 +514,20 @@ class Toolbox:
         return self.roles.get(cid)
 
     def _supervisor(self, cid):
-        """The context to ask about VKS clusters: the one given, else the active one, else the only Supervisor."""
-        if cid or self._role(self.active) == "supervisor":
-            return self._cluster(cid).id, ""
+        """The context to ask about VKS clusters: the one given or the active one when it is a Supervisor; for a
+        workload cluster, the Supervisor namespace that holds it."""
+        target = self._cluster(cid).id if cid else self.active
+        if target and self._role(target) == "supervisor":
+            return target, ""
+        sid = self._find_supervisor(target) if target else None
+        if sid:
+            return sid, f"(Asked the Supervisor context {sid}, which holds {target}; {target} itself is a workload cluster.)\n"
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(self._role, self.clusters))
         found = [c for c in self.clusters if self.roles.get(c) == "supervisor"]
-        if len(found) == 1:
-            return found[0], f"(Asked the Supervisor context {found[0]}; the active context is {self.active}.)\n"
         if found:
-            sid = self._find_supervisor(self.active) if self.active else None
-            if sid:
-                return sid, f"(Asked the Supervisor context {sid}, the vSphere namespace that holds {self.active}.)\n"
-            raise BadInput(f"Several Supervisor contexts: {', '.join(found)}. Give one as cluster.")
+            raise BadInput(f"No Supervisor context found that holds {target}. Supervisor contexts: {', '.join(found)}. "
+                           "Give the one that holds it as cluster.")
         raise BadInput("None of your contexts is a Supervisor, so the VMware side can't be seen from here. "
                        "The operator needs to log in to the Supervisor with kubectl and start ./ts again.")
 
@@ -546,6 +547,7 @@ class Toolbox:
         host = urllib.parse.urlparse(want.api).hostname if want.api else ""
         host = "" if host in (None, "127.0.0.1", "localhost") else host
         names, by_name, seen = {want.id, want.context}, None, set()
+        self.holds = getattr(self, "holds", {})
         for sid in found:
             c = self.clusters[sid]
             if (c.api or sid, c.namespace) in seen:
@@ -555,9 +557,11 @@ class Toolbox:
             for it in items:
                 end = ((it.get("spec") or {}).get("controlPlaneEndpoint") or {}).get("host", "")
                 if host and end == host:
+                    self.holds[want.id] = it["metadata"]["name"]
                     return sid
                 if by_name is None and it["metadata"]["name"] in names:
                     by_name = sid
+                    self.holds[want.id] = it["metadata"]["name"]
         return by_name
 
     def k8s_use_context(self, context):
@@ -1119,6 +1123,9 @@ class Toolbox:
 
     def vks_cluster_health(self, cluster, namespace, name_):
         cid, note = self._supervisor(cluster)
+        asked = self._cluster(cluster).id if cluster else self.active
+        if not name_ and asked != cid and getattr(self, "holds", {}).get(asked):
+            name_ = self.holds[asked]  # asked about a workload cluster: show that one VKS cluster
         if name_:
             name(name_, "cluster name")
         with ThreadPoolExecutor(max_workers=5) as pool:

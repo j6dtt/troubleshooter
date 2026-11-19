@@ -512,7 +512,7 @@ class Vks(unittest.TestCase):
 
     def test_finds_the_supervisor_from_a_workload_context(self):
         out = self.box.vks_cluster_health(None, None, "prod1")
-        self.assertIn("Asked the Supervisor context super; the active context is work", out)
+        self.assertIn("(Asked the Supervisor context super, which holds work", out)
         self.assertEqual(self.box.active, "work")  # looking does not switch
 
     def test_reports_only_what_is_wrong_with_the_reason(self):
@@ -537,8 +537,10 @@ class Vks(unittest.TestCase):
         self.assertIn("2 VKS cluster(s)", out)
         self.assertTrue(any(c[-2:] == ["-n", "team-a"] for c in self.calls))
 
-    def test_workload_context_is_told_plainly(self):
-        self.assertIn("Could not list VKS clusters in context work", self.box.vks_cluster_health("work", None, None))
+    def test_a_workload_context_given_is_asked_through_its_supervisor(self):
+        out = self.box.vks_cluster_health("work", None, None)
+        self.assertIn("(Asked the Supervisor context super, which holds work", out)
+        self.assertNotIn("Could not list VKS clusters in context work", out)
 
     def test_no_supervisor_at_all(self):
         box = tools.Toolbox(Settings(), clusters={"work": tools.Cluster("work", "", "work")})
@@ -798,6 +800,36 @@ class VksVolumes(unittest.TestCase):
             self.assertEqual(self.box._find_supervisor("work"), "super")
             out = self.box.vks_volume_check("work", "data", "shop")
         self.assertIn(f"SUPERVISOR context super, namespace team-a: claim {self.HANDLE} is Bound", out)
+
+    def test_vks_health_asked_about_a_workload_cluster_goes_to_its_supervisor(self):
+        """The model names the workload cluster; the tool asks the vSphere namespace that holds it."""
+        self.box = tools.Toolbox(Settings(), clusters={
+            "work": tools.Cluster("work", "", "work", api="https://10.9.9.9:6443"),
+            "super": tools.Cluster("super", "", "super", namespace="team-a", api="https://sup"),
+            "other": tools.Cluster("other", "", "other", namespace="team-b", api="https://sup")})
+        asked = []
+
+        def fake(argv, timeout=30, parsed=False):
+            ctx = argv[argv.index("--context") + 1]
+            asked.append((ctx, argv))
+            if "/apis/cluster.x-k8s.io" in argv:
+                return reply(ctx != "work", "{}" if ctx != "work" else "Error from server (NotFound): not found")
+            if ctx == "work":
+                return reply(False, 'error: the server doesn\'t have a resource type "clusters"')
+            if "clusters.cluster.x-k8s.io" in argv:
+                host = "10.9.9.9" if ctx == "super" else "10.1.1.1"
+                items = [vks_item("prod1", spec={"controlPlaneEndpoint": {"host": host}}, status={"phase": "Provisioned"}),
+                         vks_item("devx", status={"phase": "Provisioned"})] if ctx == "super" else []
+                return reply(True, json.dumps({"items": items}))
+            if "events" in argv:
+                return reply(True, "")
+            return reply(True, json.dumps({"items": []}))
+        with mock.patch.object(tools, "run", fake):
+            out = self.box.vks_cluster_health("work", None, None)
+        self.assertIn("(Asked the Supervisor context super, which holds work", out)
+        self.assertIn("VKS CLUSTER team-a/prod1", out)
+        self.assertNotIn("devx", out)  # only the cluster that was asked about
+        self.assertFalse(any(c == "work" and "clusters.cluster.x-k8s.io" in a for c, a in asked))
 
     def test_a_bad_claim_name_is_refused(self):
         with self.assertRaises(tools.BadInput):
