@@ -275,6 +275,8 @@ def conditions(obj, skip=()):
         kind, state = c.get("type", "?"), c.get("status")
         if kind in skip or kind in INFO:
             continue
+        if c.get("severity") == "Info":  # old (v1beta1) form: False only while something is under way, not a fault
+            continue
         # On a paused cluster, conditions that are only False because of the pause say nothing new.
         if "Paused" in skip and (c.get("reason") == "Paused" or "spec.paused" in (c.get("message") or "")):
             continue
@@ -575,7 +577,10 @@ class Toolbox:
         where = ["--server", c.server] if c.server else ["--context", c.context]
         return ["kubectl", "--kubeconfig", c.file or "/dev/null", *where, "--request-timeout=20s", *args]
 
-    def _ns(self, namespace):
+    def _ns(self, namespace, cluster=None):
+        """No namespace given: every namespace, except on a vSphere namespace login, which may only look in its own."""
+        if not namespace and cluster is not False and self.clusters and self.kind_of(self._cluster(cluster).id) == "namespace":
+            namespace = self._cluster(cluster).namespace
         return ["--all-namespaces"] if not namespace else ["-n", name(namespace, "namespace")]
 
     # ---------- whole-system view ----------
@@ -951,7 +956,7 @@ class Toolbox:
             meta.pop("managedFields", None)
             (meta.get("annotations") or {}).pop("kubectl.kubernetes.io/last-applied-configuration", None)
             return json.dumps(obj, indent=1)
-        return run(self._kubectl(cluster, "get", kind, "-o", "wide", *(self._ns(namespace) if kind not in NO_NAMESPACE else []))).text
+        return run(self._kubectl(cluster, "get", kind, "-o", "wide", *(self._ns(namespace, cluster) if kind not in NO_NAMESPACE else []))).text
 
     def _named_ns(self, cluster, kind, namespace):
         if kind in NO_NAMESPACE:
@@ -976,14 +981,14 @@ class Toolbox:
         return grep(run(self._kubectl(cluster, *args)).text, match) or "The log is empty for that period."
 
     def k8s_events(self, cluster, namespace, warnings_only):
-        args = ["get", "events", "--sort-by=.lastTimestamp", *self._ns(namespace)]
+        args = ["get", "events", "--sort-by=.lastTimestamp", *self._ns(namespace, cluster)]
         if warnings_only:
             args.append("--field-selector=type=Warning")
         r = run(self._kubectl(cluster, *args))
         return "\n".join(r.text.splitlines()[-150:])
 
     def k8s_top(self, cluster, what, namespace):
-        args = ["top", what] + (self._ns(namespace) if what == "pods" else [])
+        args = ["top", what] + (self._ns(namespace, cluster) if what == "pods" else [])
         r = run(self._kubectl(cluster, *args))
         return r.text if r.ok else f"No usage figures (metrics-server may be missing): {r.text[:200]}"
 
@@ -1111,7 +1116,7 @@ class Toolbox:
     # ---------- VMware VKS, seen from the Supervisor ----------
     def _vks_list(self, cid, kind, namespace, *extra):
         """(items, problem). Without the right to list everywhere, falls back to the context's own namespace."""
-        r = run(self._kubectl(cid, "get", kind, "-o", "json", *extra, *self._ns(namespace)), parsed=True)
+        r = run(self._kubectl(cid, "get", kind, "-o", "json", *extra, *self._ns(namespace, False)), parsed=True)
         if not r.ok and "Forbidden" in r.text and not namespace and self._cluster(cid).namespace:
             r = run(self._kubectl(cid, "get", kind, "-o", "json", *extra, "-n", self._ns1(cid, None)), parsed=True)
         if not r.ok:

@@ -2248,6 +2248,8 @@ class VsphereScope(unittest.TestCase):
             return reply(True, "{}") if supervisor else reply(False, "Error from server (NotFound): not found")
         if "events" in argv:
             return reply(True, "")
+        if "get" not in argv:  # describe, logs, top, api-resources: the fake only needs them to answer
+            return reply(True, "NAME  STATUS\nsomething  fine")
         kind = argv[argv.index("get") + 1]
         if supervisor:  # a namespace user: nothing across the Supervisor, everything in team-a
             if "--all-namespaces" in argv or kind == "nodes" or ("-n" in argv and argv[argv.index("-n") + 1] != "team-a"):
@@ -2256,6 +2258,8 @@ class VsphereScope(unittest.TestCase):
                                                 vks_item("data-2", status={"phase": "Pending"})],
                      "pods": []}.get(kind, VKS.get(kind, []))
             return reply(True, json.dumps({"items": items}))
+        if kind in ("deployments", "services"):
+            return reply(True, json.dumps({"items": []}))
         if kind == "nodes":
             return reply(True, json.dumps({"items": [{"metadata": {"name": "n1"}, "status": {"conditions": [
                 {"type": "Ready", "status": "True"}]}}]}))
@@ -2335,6 +2339,30 @@ class VsphereScope(unittest.TestCase):
         self.assertTrue(cards["team-a"]["blind"])
         self.assertFalse(cards["prod1"]["blind"])
 
+    def test_a_namespace_login_looks_in_its_own_namespace_when_none_is_given(self):
+        """The model often leaves namespace out: --all-namespaces would only get Forbidden on this login."""
+        self.calls = []
+        for tool, args in (("k8s_get", {"kind": "pods"}), ("k8s_events", {}), ("k8s_top", {"what": "pods"})):
+            t = self.box.tools[tool]
+            with mock.patch.object(tools, "run", lambda argv, **k: self.calls.append(argv) or reply(True, "")):
+                t.fn(**t.check({"cluster": "team-a", **args}))
+        asked = [a for a in self.calls if "pods" in a or "events" in a]
+        self.assertEqual(len(asked), 3, self.calls)
+        for argv in asked:
+            self.assertNotIn("--all-namespaces", argv)
+            self.assertEqual(argv[argv.index("-n") + 1], "team-a")
+
+    def test_deep_check_runs_every_tool_on_every_login(self):
+        said = []
+        with mock.patch.object(history, "timeline_rows", lambda box, cid, start: []):
+            code = cli.deep_check(Settings(), said.append, box=self.box)
+        text = "\n".join(said)
+        for cid in ("sup-ip", "team-a", "prod1"):
+            self.assertIn(f"\n{cid}  (", text)
+        self.assertIn("vks_cluster_health", text)
+        self.assertEqual(code, 0, text)
+        self.assertIn("DENIED k8s_get nodes", text)  # a namespace login may not list nodes: expected, not a bug
+
     def test_an_expired_login_is_said_not_counted(self):
         self.expired = {"team-a", "team-a-again", "prod1"}
         self.box.roles.pop("prod1", None)
@@ -2344,6 +2372,14 @@ class VsphereScope(unittest.TestCase):
         self.assertTrue(cards["team-a"]["expired"])
         self.assertEqual(cards["team-a"]["problems"], 0)
         self.assertFalse(any(k.startswith(("KUBERNETES prod1", "KUBERNETES team-a")) for k in got["problems"]))
+
+
+class OldConditions(unittest.TestCase):
+    def test_an_info_severity_condition_is_not_a_fault(self):
+        obj = {"status": {"conditions": [
+            {"type": "Ready", "status": "False", "severity": "Info", "reason": "WaitingForControlPlane"},
+            {"type": "InfrastructureReady", "status": "False", "severity": "Error", "reason": "VMCreateFailed"}]}}
+        self.assertEqual(tools.conditions(obj), ["InfrastructureReady=False (VMCreateFailed)"])
 
 
 class PausedVks(unittest.TestCase):

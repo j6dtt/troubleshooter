@@ -2,6 +2,7 @@
 import dataclasses
 import datetime
 import json
+import re
 import os
 import shutil
 import socket
@@ -467,6 +468,97 @@ def check_hosts(settings, box, report):
         report("Web page", False, f"nothing listens on port {settings.web_port} ({e}). Run docker compose up -d.")
 
 
+DENIED = re.compile(r"Forbidden|forbidden|can't read|hidden \(no permission\)")
+BROKEN = re.compile(r"^(Could not|Error|error|That failed)|could not (list|read)|doesn't have a resource type|not reachable|"
+                    r"the server could not find|Traceback|Unknown argument|Invalid ", re.M)
+
+
+def _verdict(text):
+    """ok, DENIED (this login may not look: expected for a namespace login) or FAIL (a bug or a real fault)."""
+    if BROKEN.search(text):
+        return "DENIED" if DENIED.search(text) and "doesn't have a resource type" not in text else "FAIL"
+    return "ok"
+
+
+def deep_check(settings, out=print, box=None):
+    """./ts check --deep: every Kubernetes and VKS tool against every context, the way the model calls them.
+    Look-only and no model: one line per tool and context, so a mismatch shows at once."""
+    box = box or Toolbox(dataclasses.replace(settings, allow_changes=False))
+    if not box.clusters:
+        out("No Kubernetes contexts: nothing to check.")
+        return 0
+    out(f"Checking {len(box.clusters)} context(s), every look-only Kubernetes tool, as the model calls them.")
+    out("ok = it worked; DENIED = this login may not look (normal for a namespace login); FAIL = look at it.")
+
+    def call(tool_name, **args):
+        t = box.tools.get(tool_name)
+        if not t:
+            return "FAIL", f"no tool {tool_name}"
+        try:
+            text = t.fn(**t.check(args))
+        except Exception as e:  # BadInput, or a crash: both are what this check is for
+            return "FAIL", f"{type(e).__name__}: {e}"
+        return _verdict(text), text
+
+    def first(text):
+        rows = [r.strip() for r in str(text).splitlines() if r.strip() and not r.startswith("(Asked")]
+        return (rows[0] if rows else "(empty)")[:90]
+
+    def one(cid):
+        kind, rows = box.kind_of(cid), []
+        ns = box.clusters[cid].namespace or None
+
+        def add(tool, verdict, text, note=""):
+            rows.append((tool, verdict, (note + " " if note else "") + first(text)))
+        add("map card", _verdict(box._k8s_summary(cid)), box._k8s_summary(cid))
+        for tool, args in (("k8s_kinds", {}), ("k8s_get", {"kind": "nodes"}), ("k8s_get", {"kind": "pods"}),
+                           ("k8s_events", {"warnings_only": True}), ("k8s_top", {"what": "nodes"}),
+                           ("vks_cluster_health", {}), ("vks_volume_check", {})):
+            verdict, text = call(tool, cluster=cid, **args)
+            add(tool + (f" {args.get('kind')}" if "kind" in args else ""), verdict, text)
+        # one real pod, service and deployment, picked from what this login can see
+        pods, _ = box._json(cid, "pods", *(["-n", ns] if ns else ["--all-namespaces"]))
+        pod = next(iter(pods.get("items") or []), None)
+        if pod:
+            pn, pns = pod["metadata"]["name"], pod["metadata"]["namespace"]
+            for tool, args in (("k8s_describe", {"kind": "pod", "name": pn, "namespace": pns}),
+                               ("k8s_logs", {"pod": pn, "namespace": pns, "tail": 5})):
+                verdict, text = call(tool, cluster=cid, **args)
+                add(tool, verdict, text, f"[{pns}/{pn}]")
+        services, _ = box._json(cid, "services", *(["-n", ns] if ns else ["--all-namespaces"]))
+        svc = next((s for s in services.get("items") or [] if s["metadata"]["name"] != "kubernetes"), None)
+        if svc:
+            verdict, text = call("k8s_service_check", cluster=cid, service=svc["metadata"]["name"],
+                                 namespace=svc["metadata"]["namespace"])
+            add("k8s_service_check", verdict, text, f"[{svc['metadata']['namespace']}/{svc['metadata']['name']}]")
+        deploys, _ = box._json(cid, "deployments", *(["-n", ns] if ns else ["--all-namespaces"]))
+        dep = next(iter(deploys.get("items") or []), None)
+        if dep:
+            verdict, text = call("k8s_workload_logs", cluster=cid, kind="deployments", name=dep["metadata"]["name"],
+                                 namespace=dep["metadata"]["namespace"], tail=5)
+            add("k8s_workload_logs", verdict, text, f"[{dep['metadata']['namespace']}/{dep['metadata']['name']}]")
+        try:
+            rows.append(("what changed (own record)", "ok",
+                         f"{len(history.timeline_rows(box, cid, int(time.time()) - 86400))} rows in the last day"))
+        except Exception as e:
+            rows.append(("what changed (own record)", "FAIL", f"{type(e).__name__}: {e}"[:90]))
+        return cid, kind, rows
+
+    verdict, text = call("k8s_contexts")
+    out(f"\nall contexts: k8s_contexts {verdict}")
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(one, list(box.clusters)))
+    bad = 0
+    for cid, kind, rows in results:
+        out(f"\n{cid}  ({kind}{', namespace ' + box.clusters[cid].namespace if box.clusters[cid].namespace else ''})")
+        for tool, v, said in rows:
+            bad += v == "FAIL"
+            out(f"  {v:<6} {tool:<26} {said}")
+    out(f"\n{bad} FAIL line(s)." + (" Send me those lines." if bad else " Every tool worked or was denied as expected."))
+    return 1 if bad else 0
+
+
 def check(settings):
     """Test each connection the tool depends on, and say plainly what's wrong."""
     failed = 0
@@ -551,7 +643,7 @@ def main():
         show_help()
         return 0
     if command == "check":
-        return check(settings)
+        return deep_check(settings) if "--deep" in sys.argv[2:] else check(settings)
     if command == "learn":
         return learn.main(settings, sys.argv[2:], make_log(settings))
     if command == "cases-export":  # used by ./ts, which copies cases to the shared folder as you

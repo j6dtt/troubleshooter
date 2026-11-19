@@ -160,8 +160,9 @@ def kube_survey(box):
             lines += [{"kind": "VKS cluster", "where": name, "line": text, "problems": n, "role": "vks", "context": cid,
                        "paused": text.startswith("paused")}
                       for name, (text, n) in count.items() if not any(x["where"] == name for x in lines)]
-        except Exception:
-            pass
+        except Exception as e:  # say it: otherwise the VKS cards would just vanish
+            if getattr(box, "log", None):
+                box.log(f"Could not check the VKS clusters through {cid}: {e}")
     return {"problems": found, "lines": lines}
 
 
