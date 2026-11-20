@@ -1660,7 +1660,7 @@ class Page(unittest.TestCase):
         self.items = [pod("api-7f9c6b8d4-x2kqv", "api-7f9c6b8d4"), pod("api-7f9c6b8d4-p8wn2", "api-7f9c6b8d4"),
                       pod("worker-5d9f8-q7mzk", "worker-5d9f8", hash_="5d9f8", ready=False, waiting="CrashLoopBackOff",
                           restarts=9, last=recent),
-                      pod("db-0", "db", kind="StatefulSet", hash_=None),
+                      pod("db-0", "db", kind="StatefulSet", hash_=None, restarts=6, last=old),
                       pod("report-29001-abcde", "report-29001234", kind="Job", hash_=None, phase="Succeeded", ready=False)]
         self.asked = []
 
@@ -1685,6 +1685,9 @@ class Page(unittest.TestCase):
         self.assertEqual(names[("deployment", "api")]["ready"], 2)
         self.assertIn(("statefulset", "db"), names)
         self.assertIn(("cronjob", "report"), names)    # a CronJob's job keeps its CronJob's name
+        db = names[("statefulset", "db")]["pods"][0]
+        self.assertEqual((db["trouble"], db["restarts"]), ("", 6))   # restarts days ago are history, as in the watch
+        self.assertEqual(names[("cronjob", "report")]["ready"], 1)   # a finished job counts as fine
         self.assertTrue(any("-n" in a and a[a.index("-n") + 1] == "shop" for a in self.asked))
 
     def test_one_pod_with_its_log_masked_and_the_previous_run(self):

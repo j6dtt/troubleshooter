@@ -214,8 +214,8 @@ class Site:
             restarts = sum(c.get("restartCount", 0) for c in boxes)
             last = max([tools.when(((c.get("lastState") or {}).get("terminated") or {}).get("finishedAt")) for c in boxes] or [0])
             left = box._leftover(p, now)
-            trouble = "" if left else box._pod_trouble(p, now)
-            ready = bool(boxes) and all(c.get("ready") for c in boxes)
+            trouble = "" if left else box._pod_trouble(p, now, recent=True)   # as the watch: old restarts are history
+            ready = status.get("phase") == "Succeeded" or (bool(boxes) and all(c.get("ready") for c in boxes))
             waiting = next((c["state"]["waiting"].get("reason") for c in boxes if (c.get("state") or {}).get("waiting")), "")
             kind, name = self._workload(p)
             groups.setdefault((kind, name), []).append({
@@ -247,7 +247,7 @@ class Site:
         return {"name": name, "namespace": namespace, "cluster": cluster, "workload": f"{kind} {owner}",
                 "state": next((c["state"]["waiting"].get("reason") for c in boxes if (c.get("state") or {}).get("waiting")),
                               status.get("phase", "?")),
-                "trouble": box._pod_trouble(p), "restarts": sum(c.get("restartCount", 0) for c in boxes),
+                "trouble": box._pod_trouble(p, recent=True), "restarts": sum(c.get("restartCount", 0) for c in boxes),
                 "exit_code": exit_code, "node": spec.get("nodeName", ""), "started": status.get("startTime"),
                 "images": sorted({c.get("image", "") for c in spec.get("containers") or []}),
                 "logs": box.out(str(text)), "previous": bool(previous)}
