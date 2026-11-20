@@ -2,6 +2,7 @@
 import dataclasses
 import gzip
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -1618,6 +1619,16 @@ class Page(unittest.TestCase):
         self.assertNotIn("$", row)
         self.assertTrue(web.password_ok(row.split(":", 1)[1], "a-long-password"))
 
+    def test_the_model_name_is_hidden_unless_asked_for(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WEB_SHOW_MODEL", None)
+            self.assertFalse(config.load().web_show_model)
+        with mock.patch.dict(os.environ, {"WEB_SHOW_MODEL": "on"}):
+            self.assertTrue(config.load().web_show_model)
+        src = inspect.getsource(web)
+        self.assertIn('"model": s.llm_model if s.web_show_model else ""', src)
+        self.assertIn('(me.model ? " · " + me.model : "")', webpage.JS)
+
     def test_sign_in_and_lockout(self):
         token, why = self.site.sign_in("alice", "right password", "10.0.0.5")
         self.assertEqual(self.site.who(token), "alice")
@@ -1630,6 +1641,71 @@ class Page(unittest.TestCase):
         self.assertIsNotNone(self.site.sign_in("alice", "right password", "10.0.0.7")[0])  # another address is not locked
         self.assertEqual(self.site.sign_in("ghost", "right password", "10.0.0.8"), (None, "Wrong name or password."))
         self.assertTrue(any("signed in to the page" in line for line in self.logged))
+
+    def pod_site(self):
+        """A page whose hub has one cluster, prod1, with a namespace shop."""
+        box = self.site.health.box
+        box.clusters = {"prod1": tools.Cluster("prod1", "", "prod1")}
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3 * 86400))
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 240))
+        def pod(name, owner, kind="ReplicaSet", hash_="7f9c6b8d4", ready=True, waiting="", restarts=0, phase="Running", last=None):
+            meta = {"name": name, "namespace": "shop", "labels": {"pod-template-hash": hash_} if hash_ else {},
+                    "ownerReferences": [{"kind": kind, "name": owner}] if owner else []}
+            c = {"name": "app", "ready": ready, "restartCount": restarts,
+                 "state": {"waiting": {"reason": waiting}} if waiting else {"running": {}}}
+            if last:
+                c["lastState"] = {"terminated": {"finishedAt": last, "exitCode": 1}}
+            return {"metadata": meta, "spec": {"nodeName": "w-3", "containers": [{"name": "app", "image": "shop/api:2.1"}]},
+                    "status": {"phase": phase, "startTime": old, "containerStatuses": [c]}}
+        self.items = [pod("api-7f9c6b8d4-x2kqv", "api-7f9c6b8d4"), pod("api-7f9c6b8d4-p8wn2", "api-7f9c6b8d4"),
+                      pod("worker-5d9f8-q7mzk", "worker-5d9f8", hash_="5d9f8", ready=False, waiting="CrashLoopBackOff",
+                          restarts=9, last=recent),
+                      pod("db-0", "db", kind="StatefulSet", hash_=None),
+                      pod("report-29001-abcde", "report-29001234", kind="Job", hash_=None, phase="Succeeded", ready=False)]
+        self.asked = []
+
+        def fake(argv, timeout=30, parsed=False):
+            self.asked.append(argv)
+            if "logs" in argv:
+                return reply(True, "2026-11-20T02:49:07.1Z ERROR Connection refused, password=hunter2\n")
+            if "pod" in argv:
+                return reply(True, json.dumps(self.items[2]))
+            return reply(True, json.dumps({"items": self.items}))
+        return fake
+
+    def test_a_namespace_lists_its_pods_by_workload_with_trouble_first(self):
+        fake = self.pod_site()
+        with mock.patch.object(tools, "run", fake):
+            d = self.site.pods("prod1", "shop")
+        self.assertEqual(d["count"], 5)
+        first = d["workloads"][0]
+        self.assertEqual((first["kind"], first["name"], first["trouble"]), ("deployment", "worker", 1))
+        self.assertIn("CrashLoopBackOff", first["pods"][0]["trouble"])
+        names = {(g["kind"], g["name"]): g for g in d["workloads"]}
+        self.assertEqual(names[("deployment", "api")]["ready"], 2)
+        self.assertIn(("statefulset", "db"), names)
+        self.assertIn(("cronjob", "report"), names)    # a CronJob's job keeps its CronJob's name
+        self.assertTrue(any("-n" in a and a[a.index("-n") + 1] == "shop" for a in self.asked))
+
+    def test_one_pod_with_its_log_masked_and_the_previous_run(self):
+        fake = self.pod_site()
+        with mock.patch.object(tools, "run", fake):
+            d = self.site.pod("prod1", "shop", "worker-5d9f8-q7mzk", previous=True)
+        self.assertEqual(d["state"], "CrashLoopBackOff")
+        self.assertEqual((d["restarts"], d["exit_code"], d["node"], d["images"]), (9, 1, "w-3", ["shop/api:2.1"]))
+        self.assertEqual(d["workload"], "deployment worker")
+        self.assertIn("Connection refused", d["logs"])
+        self.assertNotIn("hunter2", d["logs"])   # secrets are masked, as in container logs
+        logs = next(a for a in self.asked if "logs" in a)
+        self.assertIn("--previous", logs)
+
+    def test_pods_only_for_known_clusters_and_plain_names(self):
+        self.pod_site()
+        for args in (("elsewhere", "shop"), ("prod1", "shop; rm -rf /"), ("prod1", "")):
+            with self.assertRaises(tools.BadInput):
+                self.site.pods(*args)
+        with self.assertRaises(tools.BadInput):
+            self.site.pod("prod1", "shop", "../etc")
 
     def test_page_looks_only(self):
         chat = self.site.chat("alice")

@@ -22,7 +22,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
-from . import cases, config, history, hosts, webpage
+from . import cases, config, history, hosts, tools, webpage
 from . import autotrace
 from .autotrace import AUTO, Chat, Health, AutoTrace, WAIT, cause_in  # noqa: F401  (tests use them here)
 from .engine import Session
@@ -178,6 +178,80 @@ class Site:
         changed = [e for e in self.changes(24)["events"] if e.get("lane") == host and word in e["text"].lower()][:8]
         return {"logs": box.out(str(text)), "changes": changed}
 
+    # --- pods, for the map: a namespace's pods, and one pod with its log ---
+    def _space(self, cluster, namespace):
+        box = self.health.box
+        if cluster not in box.clusters:
+            raise BadInput(f"{cluster} is not one of the clusters.")
+        if not NAME.match(namespace or ""):
+            raise BadInput("That is not a namespace name.")
+        return box
+
+    @staticmethod
+    def _workload(pod):
+        """(kind, name) of what runs the pod: a ReplicaSet's pods belong to its Deployment."""
+        meta = pod.get("metadata") or {}
+        owner = next(iter(meta.get("ownerReferences") or []), None)
+        if not owner:
+            return "pod", meta.get("name", "?")
+        kind, name = owner.get("kind", "?"), owner.get("name", "?")
+        hash_ = (meta.get("labels") or {}).get("pod-template-hash")
+        if kind == "ReplicaSet" and hash_ and name.endswith("-" + hash_):
+            return "deployment", name[:-len(hash_) - 1]
+        if kind == "Job" and re.search(r"-\d{8,}$", name):
+            return "cronjob", re.sub(r"-\d{8,}$", "", name)
+        return kind.lower(), name
+
+    def pods(self, cluster, namespace):
+        box = self._space(cluster, namespace)
+        got, problem = box._json(cluster, "pods", "-n", namespace)
+        if problem:
+            raise BadInput(f"Could not list the pods: {problem}")
+        now, groups = time.time(), {}
+        for p in got.get("items") or []:
+            status = p.get("status") or {}
+            boxes = status.get("containerStatuses") or []
+            restarts = sum(c.get("restartCount", 0) for c in boxes)
+            last = max([tools.when(((c.get("lastState") or {}).get("terminated") or {}).get("finishedAt")) for c in boxes] or [0])
+            left = box._leftover(p, now)
+            trouble = "" if left else box._pod_trouble(p, now)
+            ready = bool(boxes) and all(c.get("ready") for c in boxes)
+            waiting = next((c["state"]["waiting"].get("reason") for c in boxes if (c.get("state") or {}).get("waiting")), "")
+            kind, name = self._workload(p)
+            groups.setdefault((kind, name), []).append({
+                "name": p["metadata"]["name"], "state": waiting or status.get("phase", "?"), "ready": ready,
+                "restarts": restarts, "last_restart": last or None, "trouble": trouble, "left_over": left,
+                "node": (p.get("spec") or {}).get("nodeName", "")})
+        out = []
+        for (kind, name), items in groups.items():
+            items.sort(key=lambda x: (not x["trouble"], x["name"]))
+            out.append({"kind": kind, "name": name, "pods": items,
+                        "ready": sum(x["ready"] for x in items), "trouble": sum(bool(x["trouble"]) for x in items)})
+        out.sort(key=lambda g: (-g["trouble"], g["kind"], g["name"]))
+        return {"cluster": cluster, "namespace": namespace, "workloads": out,
+                "count": sum(len(g["pods"]) for g in out)}
+
+    def pod(self, cluster, namespace, name, previous=False):
+        box = self._space(cluster, namespace)
+        if not NAME.match(name or ""):
+            raise BadInput("That is not a pod name.")
+        p, problem = box._json(cluster, "pod", name, "-n", namespace)
+        if problem:
+            raise BadInput(f"Could not read the pod: {problem}")
+        status, spec = p.get("status") or {}, p.get("spec") or {}
+        boxes = status.get("containerStatuses") or []
+        exit_code = next((((c.get("lastState") or {}).get("terminated") or {}).get("exitCode") for c in boxes
+                          if (c.get("lastState") or {}).get("terminated")), None)
+        text = box.k8s_logs(cluster, name, namespace, None, bool(previous), 200, None, None)
+        kind, owner = self._workload(p)
+        return {"name": name, "namespace": namespace, "cluster": cluster, "workload": f"{kind} {owner}",
+                "state": next((c["state"]["waiting"].get("reason") for c in boxes if (c.get("state") or {}).get("waiting")),
+                              status.get("phase", "?")),
+                "trouble": box._pod_trouble(p), "restarts": sum(c.get("restartCount", 0) for c in boxes),
+                "exit_code": exit_code, "node": spec.get("nodeName", ""), "started": status.get("startTime"),
+                "images": sorted({c.get("image", "") for c in spec.get("containers") or []}),
+                "logs": box.out(str(text)), "previous": bool(previous)}
+
     # --- the library ---
     def library(self):
         found = cases.all_cases(self.s)
@@ -282,13 +356,21 @@ def _handler(site):
             if parts == ["me"]:
                 box = site.health.box
                 return self._send(200, {
-                    "user": user, "host": box.here, "model": s.llm_model, "kubernetes": bool(box.clusters),
+                    "user": user, "host": box.here, "model": s.llm_model if s.web_show_model else "", "kubernetes": bool(box.clusters),
                     "hosts": [box.here, *box.agents], "contexts": list(box.clusters)})
             if parts == ["health"]:
                 return self._send(200, site.health.state())
             if parts == ["container"]:
                 try:
                     return self._send(200, site.container(query.get("host", ""), query.get("name", "")))
+                except BadInput as e:
+                    return self._send(400, {"error": str(e)})
+            if parts in (["pods"], ["pod"]):
+                try:
+                    if parts == ["pods"]:
+                        return self._send(200, site.pods(query.get("cluster", ""), query.get("namespace", "")))
+                    return self._send(200, site.pod(query.get("cluster", ""), query.get("namespace", ""), query.get("name", ""),
+                                                    query.get("previous") == "1"))
                 except BadInput as e:
                     return self._send(400, {"error": str(e)})
             if parts == ["changes"]:

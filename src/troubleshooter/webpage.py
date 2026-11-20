@@ -143,6 +143,36 @@ INDEX = r'''<!doctype html>
           <button type="button" id="ct-trace" class="primary">Trace this</button>
           <p class="muted small">Starts a trace about this container on its host.</p>
         </div>
+        <div id="space-pane" hidden>
+          <div class="row"><span id="sp-where" class="muted small"></span><span class="grow"></span>
+            <button type="button" id="sp-close">Back to problems</button></div>
+          <h2 class="title small-title"><span id="sp-name"></span> <span id="sp-count" class="warn small"></span></h2>
+          <p id="sp-sub" class="muted small"></p>
+          <div id="sp-list"></div>
+          <p class="muted small">Select a pod to see its log lines. The list is read again every minute while it is open.</p>
+        </div>
+        <div id="pod-pane" hidden>
+          <div class="row"><span id="pd-where" class="muted small"></span><span class="grow"></span>
+            <button type="button" id="pd-back">Back</button></div>
+          <h2 id="pd-name" class="title small-title"></h2>
+          <p id="pd-status"></p>
+          <dl class="facts">
+            <dt>Image</dt><dd id="pd-image" class="mono"></dd>
+            <dt>Node</dt><dd id="pd-node"></dd>
+            <dt>Started</dt><dd id="pd-started"></dd>
+            <dt>Restarts</dt><dd id="pd-restarts"></dd>
+          </dl>
+          <h3 class="label">Log lines</h3>
+          <div class="logtools">
+            <button type="button" id="pd-now" aria-pressed="true" title="The log of the container running now">Logs</button>
+            <button type="button" id="pd-prev" aria-pressed="false" title="The log of the run before the last restart: where a crash usually shows">Previous run</button>
+            <span class="grow"></span>
+            <button type="button" id="pd-errors" aria-pressed="false" title="Only errors and warnings, with the lines under them">Errors only</button>
+            <button type="button" id="pd-wrap" aria-pressed="true" title="Wrap long lines; off keeps one row per line">Wrap</button></div>
+          <div id="pd-logs" class="logs" role="log" aria-label="Pod log lines"></div>
+          <button type="button" id="pd-trace" class="primary">Trace this</button>
+          <p id="pd-trace-note" class="muted small"></p>
+        </div>
       </aside>
     </div>
   </section>
@@ -356,6 +386,19 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
 .cardlinks{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
 .spaces{display:flex;flex-wrap:wrap;gap:2px 10px;margin-top:4px}
 #map-side.wide{flex:0 1 640px}
+.spaces button{min-height:28px;padding:0 9px;border-radius:6px;font-size:12.5px;color:var(--cyan-text)}
+.spaces button.hot{color:var(--warn-text);border-color:#8a6526;background:var(--warn-ground)}
+.spaces button[aria-pressed="true"]{outline:2px solid var(--cyan);outline-offset:1px}
+.spaces .sys{min-height:28px;padding:0 6px;border:0;color:var(--muted);text-decoration:underline;font-size:12px;text-align:left}
+#container-pane,#space-pane,#pod-pane{display:flex;flex-direction:column;gap:10px}
+.wl{display:flex;flex-direction:column;gap:6px;padding:8px 0;border-top:1px solid var(--line)}
+.wl:first-child{border-top:0}
+.wlhead{display:flex;justify-content:space-between;gap:8px;font-size:13px}
+.pod{display:grid;grid-template-columns:16px minmax(0,1fr);gap:8px;align-items:center;text-align:left;width:100%;
+ min-height:40px;padding:4px 8px;border-radius:8px;border:1px solid var(--line);background:var(--deep);font-size:13px}
+.pod .n{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:12.5px}
+.pod.hot{background:var(--warn-ground);border-color:#8a6526}
+.pod.old{opacity:.65}
 .logtools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .logtools button{min-height:30px;padding:0 10px;font-size:12.5px}
 .logtools button[aria-pressed="true"]{background:#16202c;border-color:var(--cyan2);color:var(--cyan-text)}
@@ -520,6 +563,7 @@ JS = r'''"use strict";
   var me = null, chat = null, next = 0, busy = false, polling = false;
   var turn = null, raw = "", drawTimer = 0, health = null, timer = 0, view = "trace";
   var trace = null, hours = 6, kind = "cases", library = null, openDoc = null, picked = {}, changes = null, chosen = null;
+  var space = null, spaceAt = 0, podOpen = null, showSystem = {};   // the namespace and pod open on the Map
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -616,7 +660,7 @@ JS = r'''"use strict";
       me = data;
       $("login").hidden = true;
       $("app").hidden = false;
-      $("who").textContent = me.user + " · " + me.host + " · " + (me.model || "no model set");
+      $("who").textContent = me.user + " · " + me.host + (me.model ? " · " + me.model : "");  // the model only with web-show-model "on"
       fill($("host"), [""].concat(me.hosts), function (h) { return h || "any"; });
       $("host-pick").hidden = me.hosts.length < 2;
       fill($("context"), me.contexts, function (c) { return c; });
@@ -665,6 +709,7 @@ JS = r'''"use strict";
       $("map-count").hidden = !n; $("map-count").textContent = n;
       drawTop();
       if (view === "map") drawMap();
+      if (view === "map" && space && !$("space-pane").hidden && Date.now() - spaceAt > 55000) loadSpace();
       if (view === "wall") drawWall();
     }).catch(function () { drawTop(true); });
   }
@@ -997,14 +1042,28 @@ JS = r'''"use strict";
       card.appendChild(head);
       var line = c.expired ? "run kubectl vsphere login again" : c.line.replace(/^vSphere namespace [^:]+: /, "");
       card.appendChild(el("span", "muted small", (ROLE[c.role] || c.kind) + " · " + line));
-      if (c.spaces && c.spaces.length) {  // pods per namespace: where they are, and where the trouble is
-        var sp = el("div", "spaces small");
+      if (c.spaces && c.spaces.length) {  // pods per namespace: select one to see its pods; system ones fold away
+        var sp = el("div", "spaces small"), sysPods = 0, sysSpaces = 0, all = !!showSystem[c.name];
         sp.setAttribute("aria-label", "Pods per namespace");
         c.spaces.forEach(function (s) {
-          var t = el("span", s.problems ? "warn" : "muted", s.name + " " + s.pods + (s.problems ? " ▲" + s.problems : ""));
-          t.title = s.pods + " pods in namespace " + s.name + (s.problems ? ", " + s.problems + " need a look" : "");
-          sp.appendChild(t);
+          var system = SYSTEM.test(s.name) && !s.problems;
+          if (system) { sysPods += s.pods; sysSpaces += 1; }
+          if (system && !all) return;
+          var b = el("button", s.problems ? "hot" : "", s.name + " " + s.pods + (s.problems ? " ▲" + s.problems : ""));
+          b.type = "button";
+          b.title = "Show the " + s.pods + " pods in namespace " + s.name + (s.problems ? ", " + s.problems + " need a look" : "");
+          b.setAttribute("aria-pressed", String(!!space && space.cluster === c.name && space.namespace === s.name));
+          b.addEventListener("click", function () { openSpace(c.name, s.name); });
+          sp.appendChild(b);
         });
+        if (sysSpaces) {
+          var t = el("button", "sys", all ? "Hide system namespaces"
+            : "+ " + sysPods + " system pods in " + sysSpaces + (sysSpaces === 1 ? " namespace" : " namespaces"));
+          t.type = "button";
+          t.title = "kube-system, vmware-system-*, tkg-system and the like: run by Kubernetes and VMware, not your apps";
+          t.addEventListener("click", function () { showSystem[c.name] = !all; drawMap(); });
+          sp.appendChild(t);
+        }
         if (c.more_spaces) sp.appendChild(el("span", "muted", "+" + c.more_spaces + " more"));
         card.appendChild(sp);
       }
@@ -1098,41 +1157,55 @@ JS = r'''"use strict";
   var LEVEL_ERR = /\b(ERROR|ERR|FATAL|CRITICAL|PANIC|SEVERE|EXCEPTION|Traceback)\b/;
   var LEVEL_WRN = /\b(WARN|WARNING)\b/;
   var CONT = /^(\s+\S|at |Caused by|\.\.\. \d+ more)/;
-  var logText = "", errorsOnly = false;
-  function drawLogs() {
-    var box = $("ct-logs"); clear(box);
-    var shown = 0, keep = false, last = "";
-    logText.split("\n").forEach(function (raw) {
-      if (!raw) return;
-      var m = LOGTIME.exec(raw), date = m ? m[1] + " " + m[2] + " UTC" : "", t = m ? m[2] : "", msg = m ? m[3] : raw;
-      var more = CONT.test(msg);
-      var kind = LEVEL_ERR.test(msg.slice(0, 200)) ? "err" : LEVEL_WRN.test(msg.slice(0, 200)) ? "wrn" : "";
-      if (more && !kind) kind = last;      // a stack trace line belongs to the line above it
-      if (!more) last = kind;
-      keep = more ? keep : !!kind;
-      if (errorsOnly && !keep) return;
-      var row = el("div", "ll" + (kind ? " " + kind : "") + (more ? " more" : ""));
-      var ts = el("span", "t", more ? "" : t);
-      if (date && !more) ts.title = date;
-      row.appendChild(ts); row.appendChild(el("span", "m", msg));
-      box.appendChild(row); shown++;
+  // one log box: its text, its Errors only and Wrap buttons (containers use "ct", pods "pd")
+  function logBox(prefix) {
+    var lb = { text: "", errorsOnly: false };
+    lb.draw = function () {
+      var box = $(prefix + "-logs"); clear(box);
+      var shown = 0, keep = false, last = "";
+      lb.text.split("\n").forEach(function (raw) {
+        if (!raw) return;
+        var m = LOGTIME.exec(raw), date = m ? m[1] + " " + m[2] + " UTC" : "", t = m ? m[2] : "", msg = m ? m[3] : raw;
+        var more = CONT.test(msg);
+        var kind = LEVEL_ERR.test(msg.slice(0, 200)) ? "err" : LEVEL_WRN.test(msg.slice(0, 200)) ? "wrn" : "";
+        if (more && !kind) kind = last;      // a stack trace line belongs to the line above it
+        if (!more) last = kind;
+        keep = more ? keep : !!kind;
+        if (lb.errorsOnly && !keep) return;
+        var row = el("div", "ll" + (kind ? " " + kind : "") + (more ? " more" : ""));
+        var ts = el("span", "t", more ? "" : t);
+        if (date && !more) ts.title = date;
+        row.appendChild(ts); row.appendChild(el("span", "m", more ? msg.replace(/^\s+/, "") : msg));   // the row indents it
+        box.appendChild(row); shown++;
+      });
+      if (!shown) box.appendChild(el("span", "muted", lb.errorsOnly ? "No errors or warnings in these lines." : "(no log lines)"));
+      box.scrollTop = box.scrollHeight;   // newest at the bottom, in view
+    };
+    lb.set = function (text) { lb.text = text || ""; lb.draw(); };
+    lb.say = function (text, cls) { lb.text = ""; var box = $(prefix + "-logs"); clear(box); box.appendChild(el("span", cls || "muted", text)); };
+    $(prefix + "-errors").addEventListener("click", function () {
+      lb.errorsOnly = !lb.errorsOnly; this.setAttribute("aria-pressed", String(lb.errorsOnly)); lb.draw();
     });
-    if (!shown) box.appendChild(el("span", "muted", errorsOnly ? "No errors or warnings in these lines." : "(no log lines)"));
-    box.scrollTop = box.scrollHeight;   // newest at the bottom, in view
+    $(prefix + "-wrap").addEventListener("click", function () {
+      var on = this.getAttribute("aria-pressed") !== "true";
+      this.setAttribute("aria-pressed", String(on)); $(prefix + "-logs").classList.toggle("nowrap", !on);
+    });
+    return lb;
   }
-  $("ct-errors").addEventListener("click", function () {
-    errorsOnly = !errorsOnly; this.setAttribute("aria-pressed", String(errorsOnly)); drawLogs();
-  });
-  $("ct-wrap").addEventListener("click", function () {
-    var on = this.getAttribute("aria-pressed") !== "true";
-    this.setAttribute("aria-pressed", String(on)); $("ct-logs").classList.toggle("nowrap", !on);
-  });
+  var ctLog = logBox("ct"), pdLog = logBox("pd");
+
+  // the side panel shows one thing at a time: problems, a container, a namespace's pods, or one pod
+  var PANES = ["problems", "container", "space", "pod"];
+  function pane(name) {
+    PANES.forEach(function (p) { $(p + "-pane").hidden = p !== name; });
+    $("map-side").classList.toggle("wide", name !== "problems");
+    if (name !== "space" && name !== "pod") space = null;
+    if (name !== "container") chosen = null;
+  }
 
   function openContainer(host, c) {
+    pane("container");
     chosen = { host: host, c: c };
-    $("map-side").classList.add("wide");
-    $("problems-pane").hidden = true;
-    $("container-pane").hidden = false;
     $("ct-where").textContent = host + " · container";
     $("ct-name").textContent = c.name;
     $("ct-status").textContent = c.status || c.state;
@@ -1140,24 +1213,123 @@ JS = r'''"use strict";
     $("ct-image").textContent = c.image || "?";
     $("ct-restarts").textContent = String(c.restarts || 0);
     $("ct-started").textContent = c.started ? c.started.replace("T", " ").slice(0, 16) + " UTC" : "?";
-    logText = ""; clear($("ct-logs")); $("ct-logs").appendChild(el("span", "muted", "Loading..."));
+    ctLog.say("Loading...");
     clear($("ct-changes"));
     $("ct-changes").appendChild(el("p", "muted", "Loading..."));
     drawMap();
     api("GET", "/api/container?host=" + encodeURIComponent(host) + "&name=" + encodeURIComponent(c.name)).then(function (d) {
       if (!chosen || chosen.c.name !== c.name) return;
-      logText = d.logs || ""; drawLogs();
+      ctLog.set(d.logs);
       var box = $("ct-changes"); clear(box);
       if (!d.changes.length) box.appendChild(el("p", "muted", "Nothing recorded."));
       d.changes.forEach(function (e) {
         var p = el("p"); p.appendChild(el("span", "muted mono", clock(e.time) + "  ")); p.appendChild(document.createTextNode(e.text)); box.appendChild(p);
       });
-    }).catch(function (err) { logText = ""; clear($("ct-logs")); $("ct-logs").appendChild(el("span", "warn", err.message)); clear($("ct-changes")); });
+    }).catch(function (err) { ctLog.say(err.message, "warn"); clear($("ct-changes")); });
   }
-  $("ct-close").addEventListener("click", function () { chosen = null; $("map-side").classList.remove("wide"); $("problems-pane").hidden = false; $("container-pane").hidden = true; drawMap(); });
+  $("ct-close").addEventListener("click", function () { pane("problems"); drawMap(); });
   $("ct-trace").addEventListener("click", function () {
     if (!chosen) return;
     traceThis("Container " + chosen.c.name + " on " + chosen.host + " is " + (chosen.c.status || chosen.c.state) + ". What is wrong with it?", chosen.host);
+  });
+
+  // ================= Pods: a namespace's pods, then one pod =================
+  function openSpace(cluster, namespace) {
+    pane("space");
+    space = { cluster: cluster, namespace: namespace, data: null };
+    $("sp-where").textContent = cluster + " · namespace";
+    $("sp-name").textContent = namespace;
+    $("sp-count").textContent = "";
+    $("sp-sub").textContent = "Loading...";
+    clear($("sp-list"));
+    drawMap();
+    loadSpace();
+  }
+  function loadSpace() {
+    if (!space) return;
+    var want = space;
+    spaceAt = Date.now();
+    api("GET", "/api/pods?cluster=" + encodeURIComponent(want.cluster) + "&namespace=" + encodeURIComponent(want.namespace)).then(function (d) {
+      if (space !== want) return;
+      want.data = d; drawSpace();
+    }).catch(function (err) { if (space === want) { $("sp-sub").textContent = err.message; $("sp-sub").className = "warn small"; } });
+  }
+  function drawSpace() {
+    var d = space && space.data;
+    if (!d) return;
+    var bad = d.workloads.reduce(function (n, g) { return n + g.trouble; }, 0);
+    $("sp-count").textContent = bad ? "▲ " + bad : "";
+    $("sp-sub").className = "muted small";
+    $("sp-sub").textContent = d.count + (d.count === 1 ? " pod" : " pods") + " in " + d.workloads.length
+      + (d.workloads.length === 1 ? " workload" : " workloads") + (bad ? "; those that need a look come first" : "");
+    var list = $("sp-list"); clear(list);
+    if (!d.count) list.appendChild(el("p", "muted", "No pods in this namespace."));
+    d.workloads.forEach(function (g) {
+      var box = el("div", "wl"), head = el("div", "wlhead"), who = el("span");
+      who.appendChild(document.createTextNode(g.kind + " ")); who.appendChild(el("b", "", g.name));
+      head.appendChild(who);
+      head.appendChild(el("span", g.ready === g.pods.length ? "okc" : "warn", g.ready + " of " + g.pods.length + " ready"));
+      box.appendChild(head);
+      g.pods.forEach(function (p) {
+        var cls = p.trouble ? "hot" : p.left_over ? "old" : "";
+        var b = el("button", "pod" + (cls ? " " + cls : "")); b.type = "button";
+        b.appendChild(el("i", "sq " + (p.trouble ? "restarting" : p.ready || p.state === "Succeeded" ? "running" : "exited")));
+        var words = el("span");
+        words.appendChild(el("span", "n", p.name));
+        var note = p.trouble ? p.trouble : p.left_over ? p.state + " · left over, not a problem" : p.state + " · " + p.restarts + " ↻"
+          + (p.restarts && p.last_restart ? " · last " + ago(p.last_restart) + " ago" : "");
+        words.appendChild(el("span", "small " + (p.trouble ? "warn" : "muted"), note));
+        b.appendChild(words);
+        b.setAttribute("aria-label", p.name + ": " + note);
+        b.addEventListener("click", function () { openPod(space.cluster, space.namespace, p.name, false); });
+        box.appendChild(b);
+      });
+      list.appendChild(box);
+    });
+  }
+  function openPod(cluster, namespace, name, previous) {
+    var back = space;
+    pane("pod");
+    space = back;   // keep the namespace, to go back to
+    podOpen = { cluster: cluster, namespace: namespace, name: name, previous: previous };
+    $("pd-where").textContent = cluster + " · " + namespace;
+    $("pd-back").textContent = "Back to " + namespace;
+    $("pd-name").textContent = name;
+    $("pd-status").textContent = "Loading..."; $("pd-status").className = "muted";
+    $("pd-now").setAttribute("aria-pressed", String(!previous));
+    $("pd-prev").setAttribute("aria-pressed", String(!!previous));
+    ["pd-image", "pd-node", "pd-started", "pd-restarts"].forEach(function (id) { $(id).textContent = ""; });
+    $("pd-trace-note").textContent = "Starts a trace about this pod in cluster " + cluster + ".";
+    pdLog.say("Loading...");
+    var want = podOpen;
+    api("GET", "/api/pod?cluster=" + encodeURIComponent(cluster) + "&namespace=" + encodeURIComponent(namespace)
+        + "&name=" + encodeURIComponent(name) + (previous ? "&previous=1" : "")).then(function (d) {
+      if (podOpen !== want) return;
+      want.state = d.trouble || d.state;
+      $("pd-status").textContent = (d.trouble || d.state) + (d.exit_code !== null && d.exit_code !== undefined && d.restarts ? " (last exit code " + d.exit_code + ")" : "");
+      $("pd-status").className = d.trouble ? "warn" : "okc";
+      $("pd-image").textContent = d.images.join(", ") || "?";
+      $("pd-node").textContent = d.node || "?";
+      $("pd-started").textContent = d.started ? d.started.replace("T", " ").slice(0, 16) + " UTC (" + ago(Date.parse(d.started) / 1000) + " ago)" : "?";
+      $("pd-restarts").textContent = String(d.restarts);
+      pdLog.set(d.logs);
+    }).catch(function (err) {
+      if (podOpen !== want) return;
+      $("pd-status").textContent = ""; pdLog.say(err.message, "warn");
+    });
+  }
+  $("sp-close").addEventListener("click", function () { pane("problems"); drawMap(); });
+  $("pd-back").addEventListener("click", function () {
+    var back = space; podOpen = null;
+    if (back) { pane("space"); space = back; drawSpace(); loadSpace(); } else pane("problems");
+    drawMap();
+  });
+  $("pd-now").addEventListener("click", function () { if (podOpen) openPod(podOpen.cluster, podOpen.namespace, podOpen.name, false); });
+  $("pd-prev").addEventListener("click", function () { if (podOpen) openPod(podOpen.cluster, podOpen.namespace, podOpen.name, true); });
+  $("pd-trace").addEventListener("click", function () {
+    if (!podOpen) return;
+    traceThis("Pod " + podOpen.namespace + "/" + podOpen.name + " in cluster " + podOpen.cluster + " is "
+      + (podOpen.state || "not right") + ". What is wrong with it?", podOpen.cluster);
   });
 
   // ================= What changed =================

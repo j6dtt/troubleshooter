@@ -85,6 +85,8 @@ x-settings:
   agent-hosts: &agent-hosts ""
   # Port the agents listen on, and the page's own port (https).
   agent-port: &agent-port "8001"
+  # The model's name in the page's top bar: "on" shows it.
+  web-show-model: &web-show-model "off"
   web-port: &web-port "9001"
   # Auto-trace (a hub, or a host alone): a new problem starts its
   # own look-only trace, with the learn model when one is set.
@@ -174,6 +176,7 @@ services:
       AGENT_HOSTS: *agent-hosts
       AGENT_PORT: *agent-port
       WEB_PORT: *web-port
+      WEB_SHOW_MODEL: *web-show-model
       AUTO_TRACE: *auto-trace
       AUTO_TRACE_PER_HOUR: *auto-trace-per-hour
       LINK_MINUTES: *link-minutes

@@ -52,6 +52,7 @@ class Settings:
     agent_hosts: tuple = ()       # each "name" or "name=address"
     agent_port: int = 8001
     web_port: int = 9001
+    web_show_model: bool = False  # show the model's name in the page's top bar
     agent_key: str = field(default="", repr=False)
     tls_key: str = field(default="", repr=False)      # the private key, base64 of its PEM
     tls_cert: str = "/certs/troubleshooter-cert.pem"
@@ -100,6 +101,7 @@ def load():
         agent_hosts=tuple(_list("AGENT_HOSTS")),
         agent_port=int(os.environ.get("AGENT_PORT", "8001") or 8001),
         web_port=int(os.environ.get("WEB_PORT", "9001") or 9001),
+        web_show_model=_flag("WEB_SHOW_MODEL", "off"),
         agent_key=os.environ.get("AGENT_KEY", ""),
         tls_key=os.environ.get("TLS_KEY", ""),
         tls_cert=os.environ.get("TLS_CERT", "/certs/troubleshooter-cert.pem"),

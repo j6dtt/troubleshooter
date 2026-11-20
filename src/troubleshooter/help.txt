@@ -301,6 +301,10 @@ The page looks only: it never changes anything. Fixes stay in ./ts.
   Map            the first page: each host's containers as
                  squares, and each cluster; select a square for its
                  logs and changes. Open problems are listed beside it.
+                 On a cluster, select a namespace for its pods by
+                 workload, then a pod for its log (or its previous
+                 run). System namespaces fold away; "+ N system pods"
+                 shows them.
   Trace          the chat, drawn as a trail: symptom, evidence,
                  cause, fix. Select a step to see its full output.
   What changed   one lane per host and cluster: changes, problems
