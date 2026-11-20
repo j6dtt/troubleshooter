@@ -24,7 +24,7 @@ container (ts record, always on)
 read it:
   ./ts → /traces      list
   ./ts → /traces 3    open as this chat: ask more, fix
-  page (hub only)     Map, What changed, Console
+  page (hub only)     Map, What changed, Wall
 ```
 
 Who does it:
@@ -191,8 +191,8 @@ This host runs as: alone.
   - a purple diamond marks a finished auto-trace;
     select it in the list to open the trace, even
     after a restart
-- **Console:** "▲ problem ← change" and
-  "◆ auto-trace: …" lines in the live feed.
+- **Wall screen:** each problem with what its
+  auto-trace found, and "◆" lines in the last hour.
 
 ## Rules
 

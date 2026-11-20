@@ -9,3 +9,4 @@ certs/*
 runbooks/*
 !runbooks/.gitkeep
 kube-home/
+compose.yaml

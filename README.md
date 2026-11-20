@@ -15,6 +15,7 @@ host's `python3` (3.6 or newer). Everything is in `src/`, so an update is
 
 ## Use
 
+    cp compose.example.yaml compose.yaml   once; then edit its settings block
     docker compose up -d
     ./ts check     test every connection
     ./ts           chat
@@ -24,7 +25,8 @@ In the chat: `/context` lists and switches Kubernetes contexts, `/new` forgets t
 leaves, Ctrl-C stops an answer. A fix shows the exact command and runs only
 if you type `yes`. Piped input can never approve.
 
-Settings are in the block at the top of `compose.yaml`.
+Settings are in the block at the top of `compose.yaml`, your own copy of
+`compose.example.yaml`. It is never in git, so host names and ports stay local.
 Secrets go in `.env` (`LLM_API_KEY`, empty for vLLM).
 
 ## Runbooks

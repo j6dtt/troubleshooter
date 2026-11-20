@@ -3,8 +3,8 @@
 Nothing is loaded from anywhere else: no fonts, scripts or styles from the internet. The script puts
 text on the page as text, never as markup, so nothing a log or a model says can run in the browser.
 
-Five views: Trace (the chat, drawn as a trail from symptom to fix), Map (every host and cluster),
-What changed (one lane per host and cluster), Console (for a wall screen) and Library.
+Five views: Map (every host and cluster; the first page), Trace (the chat, drawn as a trail from symptom
+to fix), What changed (one lane per host and cluster), Wall (the Map made big for a TV) and Library.
 """
 
 INDEX = r'''<!doctype html>
@@ -32,13 +32,15 @@ INDEX = r'''<!doctype html>
     <span class="brand">TRACER</span>
     <span class="trail-mark small" aria-hidden="true"><i></i><b></b><i></i><b></b><i></i></span>
     <nav aria-label="Sections">
-      <button type="button" data-view="trace">Trace</button>
-      <button type="button" data-view="map">Map <span id="map-count" class="count" hidden></span></button>
-      <button type="button" data-view="changes">What changed</button>
-      <button type="button" data-view="console">Console</button>
-      <button type="button" data-view="library">Library</button>
+      <button type="button" data-view="map"><svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5l5-2 4 2 5-2v12l-5 2-4-2-5 2z M8 3v12 M12 5v12"/></svg><span class="lbl">Map</span> <span id="map-count" class="count" hidden></span></button>
+      <button type="button" data-view="trace"><svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><circle cx="4" cy="15" r="2"/><circle cx="16" cy="5" r="2"/><path d="M6 15h4a3 3 0 0 0 0-6H9a3 3 0 0 1 0-6h5"/></svg><span class="lbl">Trace</span> <span id="trace-live" class="live" hidden title="Traces running now"><i></i><b></b></span></button>
+      <button type="button" data-view="changes"><svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2"/></svg><span class="lbl long">What changed</span><span class="lbl short">Changes</span></button>
+      <button type="button" data-view="library"><svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 3h4v14H4z M9 3h4v14H9z M14 4l3 1-2 12-3-1"/></svg><span class="lbl">Library</span></button>
     </nav>
     <span class="grow"></span>
+    <button type="button" id="status-pill" class="pill" title="Go to the Map"></button>
+    <span id="top-checked" class="muted small checked-note"></span>
+    <button type="button" id="wall-open" class="wallbtn" title="Show the wall screen: big, look-only, for a TV"><svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="3" width="16" height="11" rx="1.5"/><path d="M7 17h6 M10 14v3"/></svg>Wall</button>
     <span id="who" class="chip mono"></span>
     <button type="button" id="sign-out">Sign out</button>
   </header>
@@ -134,7 +136,10 @@ INDEX = r'''<!doctype html>
           <h3 class="label">Changed in the last day</h3>
           <div id="ct-changes" class="small"></div>
           <h3 class="label">Last log lines</h3>
-          <pre id="ct-logs" class="mono box"></pre>
+          <div class="logtools"><span class="grow"></span>
+            <button type="button" id="ct-errors" aria-pressed="false" title="Only errors and warnings, with the lines under them">Errors only</button>
+            <button type="button" id="ct-wrap" aria-pressed="true" title="Wrap long lines; off keeps one row per line">Wrap</button></div>
+          <div id="ct-logs" class="logs" role="log" aria-label="Log lines"></div>
           <button type="button" id="ct-trace" class="primary">Trace this</button>
           <p class="muted small">Starts a trace about this container on its host.</p>
         </div>
@@ -176,34 +181,24 @@ INDEX = r'''<!doctype html>
     <div id="changes" class="list"></div>
   </section>
 
-  <!-- ===== Console ===== -->
-  <section id="view-console" class="view console" hidden>
-    <div class="row end-row">
-      <pre class="logo" aria-label="Tracer"><span>████████╗██████╗  █████╗  ██████╗███████╗██████╗ </span>
-<span>╚══██╔══╝██╔══██╗██╔══██╗██╔════╝██╔════╝██╔══██╗</span>
-<span>   ██║   ██████╔╝███████║██║     █████╗  ██████╔╝</span>
-<span>   ██║   ██╔══██╗██╔══██║██║     ██╔══╝  ██╔══██╗</span>
-<span>   ██║   ██║  ██║██║  ██║╚██████╗███████╗██║  ██║</span>
-<span>   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝</span></pre>
-      <span id="console-watching" class="muted"></span>
-      <span class="grow"></span>
-      <button type="button" id="full-screen">Full screen</button>
+  <!-- ===== Wall screen ===== -->
+  <section id="view-wall" class="wall" hidden>
+    <div class="wallhead">
+      <span class="row nogap"><span class="brand">TRACER</span><span class="trail-mark" aria-hidden="true"><i></i><b></b><i></i><b></b><i></i></span></span>
+      <div id="wall-state" class="state" role="status"><span class="ring"></span><span id="wall-words">Loading…</span></div>
+      <div class="clock"><b id="wall-clock">--:--</b><span id="wall-checked"></span></div>
     </div>
-    <div class="row top-row">
-      <div id="console-status" class="card status">
-        <span class="muted">STATUS</span>
-        <span id="console-count" class="big-number">-</span>
-        <span id="console-words"></span>
-        <span id="console-oldest" class="muted"></span>
+    <div class="wallbody">
+      <div class="wallmain">
+        <div id="wall-k8s-block"><h2>Kubernetes</h2><div id="wall-k8s" class="wcards"></div><p id="wall-k8s-more" class="muted small"></p></div>
+        <div><h2>Hosts</h2><div id="wall-hosts" class="wcards"></div></div>
       </div>
-      <div class="card lanes-box">
-        <div id="console-lanes" class="console-lanes"></div>
+      <div class="wallside">
+        <h2>Needs a look</h2><div id="wall-need" class="need"></div>
+        <h2>Last hour</h2><div id="wall-recent" class="recent"></div>
       </div>
     </div>
-    <div class="card feed">
-      <span class="muted">LIVE · newest first · refreshed every 30 s</span>
-      <div id="console-feed"></div>
-    </div>
+    <div class="walltail"><span>Wall screen · look only · refreshed every 30 s</span><span class="grow"></span><span>Esc or a mouse move shows the menu</span></div>
   </section>
 
   <!-- ===== Library ===== -->
@@ -306,7 +301,7 @@ nav button[aria-current="page"]{background:#16202c;color:var(--text);font-weight
 .view{padding:18px 22px;display:flex;flex-direction:column;gap:16px}
 .two{display:flex;flex-wrap:wrap;align-items:flex-start;gap:18px}
 .main{flex:999 1 560px;min-width:0;display:flex;flex-direction:column;gap:12px}
-.side{flex:1 1 320px;min-width:0;display:flex;flex-direction:column;gap:10px;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto}
+.side{flex:1 1 400px;min-width:0;display:flex;flex-direction:column;gap:10px;position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto}
 .side-left{flex:1 1 340px;min-width:0;display:flex;flex-direction:column;gap:10px}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
 .facts{display:grid;grid-template-columns:74px minmax(0,1fr);gap:8px 12px;margin:0;font-size:13.5px}
@@ -360,6 +355,19 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
 .cards .card.flash{box-shadow:0 0 0 2px var(--cyan)}
 .cardlinks{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
 .spaces{display:flex;flex-wrap:wrap;gap:2px 10px;margin-top:4px}
+#map-side.wide{flex:0 1 640px}
+.logtools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.logtools button{min-height:30px;padding:0 10px;font-size:12.5px}
+.logtools button[aria-pressed="true"]{background:#16202c;border-color:var(--cyan2);color:var(--cyan-text)}
+.logs{background:var(--deep);border-radius:8px;padding:8px 10px;max-height:420px;overflow-y:auto;overflow-x:hidden;font-family:var(--mono);font-size:12px;line-height:1.45}
+.logs.nowrap{overflow-x:auto}
+.ll{display:grid;grid-template-columns:62px minmax(0,1fr);gap:0 8px;padding:1px 0}
+.ll .t{color:var(--muted)}
+.ll .m{white-space:pre-wrap;overflow-wrap:anywhere}
+.logs.nowrap .ll .m{white-space:pre;overflow-wrap:normal}
+.ll.err .m{color:var(--bad)}
+.ll.wrn .m{color:var(--warn-text)}
+.ll.more .m{padding-left:12px}
 .cardlinks button{min-height:32px;padding:0 10px;border-radius:6px;color:var(--cyan-text);font-size:13px}
 .cards .head{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
 .cards .name{font-weight:700;font-size:16px;overflow-wrap:anywhere}
@@ -419,31 +427,90 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
 .tag.auto{background:#241c40;color:#c3b2f7}
 .picked{display:flex;flex-wrap:wrap;gap:10px;align-items:center;border-color:var(--blue)}
 
-/* console */
-.console{font-family:var(--mono);background:#06090d;min-height:calc(100vh - 62px)}
-.console .card{background:#06090d;border-color:#1c2530;border-radius:4px}
-.logo{margin:0;font-size:12px;line-height:1.05;font-weight:700;white-space:pre;font-family:var(--mono)}
-.logo span:nth-child(1){color:#33e1ff}.logo span:nth-child(2){color:#2fd0ff}.logo span:nth-child(3){color:#2fb4ff}
-.logo span:nth-child(4){color:#3498ff}.logo span:nth-child(5){color:#3d7bff}.logo span:nth-child(6){color:#5a6cff}
-.end-row{align-items:flex-end;gap:20px}
-.top-row{align-items:stretch;gap:16px}
-.status{flex:1 1 240px;display:flex;flex-direction:column;gap:4px}
-.status.hot{border-color:var(--warn)!important}
-.big-number{font-size:64px;line-height:1;font-weight:700;color:var(--ok)}
-.status.hot .big-number{color:var(--warn)}
-.lanes-box{flex:999 1 560px;min-width:0;overflow-x:auto}
-.console-lanes{display:grid;grid-template-columns:minmax(90px,150px) minmax(180px,1fr) minmax(120px,190px);gap:10px 16px;align-items:center;font-size:13.5px}
-.bars{display:flex;gap:3px;align-items:flex-end;height:24px}
-.bars span{flex:1;background:#1f6f8a;min-height:2px}
-.bars span.hot{background:var(--warn)}
-.feed{display:flex;flex-direction:column;gap:4px;font-size:13.5px}
-.feed div{white-space:pre-wrap;overflow-wrap:anywhere}
+/* top bar: icon tabs, glowing underline, status pill */
+.top{min-height:60px;padding-top:0;padding-bottom:0;background:linear-gradient(180deg,#0f1620,#0b1017)}
+nav{align-self:stretch}
+nav button{display:inline-flex;align-items:center;gap:8px;position:relative;border-radius:0;min-height:60px;padding:0 14px;font-weight:500}
+nav button:hover{color:var(--text)}
+nav button[aria-current="page"]{background:none;color:var(--text)}
+nav button[aria-current="page"]::after{content:"";position:absolute;left:10px;right:10px;bottom:-1px;height:3px;border-radius:3px 3px 0 0;
+ background:linear-gradient(90deg,var(--cyan),var(--blue));box-shadow:0 0 12px rgba(51,225,255,.7)}
+nav button[aria-current="page"] .ic{color:var(--cyan)}
+.ic{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.live{display:inline-flex;align-items:center;gap:5px;border:1px solid #1d5d6b;border-radius:999px;padding:0 7px;font-size:11.5px;font-weight:600;color:var(--cyan)}
+.live i{width:6px;height:6px;border-radius:50%;background:var(--cyan);box-shadow:0 0 6px var(--cyan)}
+.pill{display:inline-flex;align-items:center;gap:8px;min-height:34px;border-radius:999px;padding:0 12px;font-size:13px}
+.pill.bad{color:var(--warn-text);border-color:#8a6526;background:var(--warn-ground)}
+.pill.good{color:var(--ok);border-color:#1f5a47;background:#0f241d}
+.pill b{font-size:15px}
+.checked-note.late{color:var(--warn)}
+.wallbtn{display:inline-flex;align-items:center;gap:6px;min-height:34px;padding:0 12px;font-size:13px;color:var(--cyan-text)}
+.nogap{gap:0}
+.lbl.short{display:none}
+/* wall screen */
+body.walling .top{position:fixed;inset:0 0 auto;z-index:8;transform:translateY(-100%);transition:transform .2s}
+body.walling.peek .top{transform:none}
+.wall{min-height:100vh;display:flex;flex-direction:column;background:radial-gradient(1200px 500px at 50% -200px,#13202d,var(--ground))}
+.wallhead{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;padding:18px 32px;border-bottom:1px solid var(--line)}
+.wallhead .brand{font-size:24px}
+.wallhead .trail-mark{margin-left:12px}
+.state{display:flex;align-items:center;gap:14px;font-size:34px;font-weight:800;letter-spacing:.5px;color:var(--muted)}
+.state.bad{color:var(--warn)}
+.state.good{color:var(--ok)}
+.ring{width:20px;height:20px;border-radius:50%;background:currentColor;box-shadow:0 0 0 6px rgba(154,167,182,.15),0 0 24px currentColor}
+.clock{justify-self:end;text-align:right}
+.clock b{font-size:34px;font-family:var(--mono);font-weight:600;letter-spacing:1px;font-variant-numeric:tabular-nums}
+.clock span{display:block;color:var(--muted);font-size:13px}
+.clock span.late{color:var(--warn)}
+.wallbody{flex:1;display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,460px);gap:24px;padding:22px 32px}
+.wallmain,.wallside{display:flex;flex-direction:column;gap:22px;min-width:0}
+.wallside{gap:10px}
+.wall h2{font-size:13px;letter-spacing:1.4px;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+.wallside h2{margin:0}
+.wallside h2+div{margin-bottom:12px}
+.wcards{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
+.wcard{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.wcard.hot{border-color:var(--warn);box-shadow:0 0 0 1px var(--warn),0 0 22px rgba(255,181,71,.18)}
+.wcard.stale{border:1px dashed var(--warn)}
+.wcard .top2{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.wcard .nm{font-size:19px;font-weight:700;overflow-wrap:anywhere}
+.wcard .st{font-size:14px;font-weight:600;white-space:nowrap}
+.wcard .ln{color:var(--muted);font-size:14px;overflow-wrap:anywhere}
+.kind{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--cyan-text)}
+.big{font-size:30px;font-weight:800;font-family:var(--mono);line-height:1;font-variant-numeric:tabular-nums}
+.big small{font-size:14px;color:var(--muted);font-family:var(--sans,system-ui);font-weight:500}
+.wsq{display:flex;flex-wrap:wrap;gap:4px}
+.wsq i{width:16px;height:16px;border-radius:4px;background:var(--run)}
+.wsq i.u{background:#3a2a10;outline:2px solid var(--warn);outline-offset:-2px}
+.wsq i.x{background:none;outline:2px dashed #55606e;outline-offset:-2px}
+.need{display:flex;flex-direction:column;gap:12px}
+.nitem{background:var(--warn-ground);border:1px solid #8a6526;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:6px}
+.nitem .t1{font-size:17px;font-weight:600;overflow-wrap:anywhere}
+.nitem .t2{color:var(--warn-text);font-size:13.5px}
+.nitem .t3{color:var(--muted);font-size:13px}
+.recent{display:flex;flex-direction:column;gap:6px;font-size:13.5px;color:var(--muted)}
+.recent div{overflow-wrap:anywhere}
+.recent .tm{font-family:var(--mono);color:#6f7d8d;margin-right:8px}
+.walltail{padding:10px 32px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;display:flex;flex-wrap:wrap;gap:12px 24px}
+@media (prefers-reduced-motion:reduce){body.walling .top{transition:none}}
 
 .doc{max-height:70vh;overflow:auto}
 .veil{position:fixed;inset:0;background:rgba(5,8,12,.72);display:flex;align-items:center;justify-content:center;padding:16px;z-index:10}
 .dialog{width:min(720px,100%);max-height:90vh;overflow:auto;display:flex;flex-direction:column;gap:12px}
 @media (max-width:720px){.side{position:static;max-height:none}.bubble{max-width:100%}.ask{position:static}
-.link{display:none}.trail{flex-direction:column;align-items:flex-start}.view{padding:14px 16px}.logo{font-size:7px}}
+.link{display:none}.trail{flex-direction:column;align-items:flex-start}.view{padding:14px 16px}
+ .top{gap:10px;padding:0 16px;min-height:56px}
+ #who,#top-checked,#wall-open{display:none}
+ .lbl.long{display:none}.lbl.short{display:inline}
+ .pill .pw{display:none} #sign-out{min-height:34px;padding:0 10px;font-size:13px}
+ nav{position:fixed;left:0;right:0;bottom:0;z-index:7;background:#0e141c;border-top:1px solid var(--line);justify-content:space-around;
+  padding:0 4px env(safe-area-inset-bottom,0px);align-self:auto}
+ nav button{flex:1;flex-direction:column;gap:2px;min-height:60px;padding:6px 2px 0;font-size:11px;justify-content:center}
+ nav button .count,nav button .live{position:absolute;top:4px;left:50%;margin-left:6px;font-size:10px;padding:0 5px}
+ nav button[aria-current="page"]::after{top:0;bottom:auto;border-radius:0 0 3px 3px}
+ #app{padding-bottom:70px}
+ .wallhead{grid-template-columns:1fr;justify-items:start;padding:14px 16px}.clock{justify-self:start;text-align:left}
+ .state{font-size:24px}.wallbody{grid-template-columns:minmax(0,1fr);padding:16px}.walltail{padding:10px 16px}}
 '''
 
 JS = r'''"use strict";
@@ -554,7 +621,7 @@ JS = r'''"use strict";
       $("host-pick").hidden = me.hosts.length < 2;
       fill($("context"), me.contexts, function (c) { return c; });
       $("context-pick").hidden = !me.kubernetes;
-      show(location.hash.slice(1) || "trace");
+      show(location.hash.slice(1) || "map");
       openChat();
       refresh();
       clearInterval(timer);
@@ -567,22 +634,26 @@ JS = r'''"use strict";
   }
 
   // ---------- views ----------
-  var views = ["trace", "map", "changes", "console", "library"];
-  var old = { chat: "trace", health: "map" };
+  var views = ["map", "trace", "changes", "wall", "library"];
+  var old = { chat: "trace", health: "map", console: "wall" };
   function show(name) {
     name = old[name] || name;
-    if (views.indexOf(name) < 0) name = "trace";
+    if (views.indexOf(name) < 0) name = "map";
     view = name;
     views.forEach(function (v) { $("view-" + v).hidden = v !== name; });
+    document.body.classList.toggle("walling", name === "wall");
+    document.body.classList.remove("peek");
+    if (name !== "wall" && document.fullscreenElement) document.exitFullscreen().catch(function () {});
     each("nav button", function (b) {
       if (b.dataset.view === name) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
     });
     if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
     if (name === "map" && health) drawMap();
     if (name === "changes") loadChanges();
-    if (name === "console") drawConsole();
+    if (name === "wall") drawWall();
     if (name === "library") loadLibrary();
   }
+  window.addEventListener("hashchange", function () { var want = location.hash.slice(1); if (me && want && want !== view) show(want); });
   each("nav button", function (b) { b.addEventListener("click", function () { show(b.dataset.view); }); });
 
   // Every 30 s: health for the map and the badge; the console also wants the changes.
@@ -592,9 +663,10 @@ JS = r'''"use strict";
       health = h;
       var n = h.problems.length;
       $("map-count").hidden = !n; $("map-count").textContent = n;
+      drawTop();
       if (view === "map") drawMap();
-      if (view === "console") drawConsole();
-    }).catch(function () {});
+      if (view === "wall") drawWall();
+    }).catch(function () { drawTop(true); });
   }
 
   // ================= Trace =================
@@ -636,6 +708,7 @@ JS = r'''"use strict";
   }
   function setBusy(b) {
     busy = b;
+    drawTop();
     $("ask").disabled = b; $("report").disabled = b; $("case").disabled = b; $("new").disabled = b;
     $("context").disabled = b;
     $("stop").hidden = !b;
@@ -797,7 +870,7 @@ JS = r'''"use strict";
         if (kept) api("POST", "/api/chat/" + chat + "/save-case", { text: kept }).then(poll).catch(failed);
       });
   }
-  // An auto-trace from the Map, What changed or the Console. Your own trace is kept to come back to.
+  // An auto-trace from the Map or What changed. Your own trace is kept to come back to.
   function openTrace(id) {
     show("trace");
     if (id !== chat) openChat(id);
@@ -883,8 +956,9 @@ JS = r'''"use strict";
   function laneProblems(name) { return health.problems.filter(function (p) { return p.lane === name; }).length; }
   function drawMap() {
     var h = health;
-    $("map-when").textContent = h.failed ? "The last check failed: " + h.failed
-      : h.checked ? "Checked " + ago(h.checked) + " ago, every " + h.every + " s" : "First check is running...";
+    // when it was checked is in the top bar; here only why a check failed, or that the first one is running
+    $("map-when").textContent = h.failed ? "The last check failed: " + h.failed : h.checked ? "" : "First check is running...";
+    $("map-when").className = h.failed ? "warn small" : "muted small";
     // clusters
     var cl = $("clusters"); clear(cl);
     $("cluster-block").hidden = !h.clusters.length;
@@ -1019,8 +1093,44 @@ JS = r'''"use strict";
       pl.appendChild(row);
     });
   }
+  // ---- log lines: short time, wrapped message, errors in red, warnings in orange ----
+  var LOGTIME = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)\S*\s?(.*)$/;
+  var LEVEL_ERR = /\b(ERROR|ERR|FATAL|CRITICAL|PANIC|SEVERE|EXCEPTION|Traceback)\b/;
+  var LEVEL_WRN = /\b(WARN|WARNING)\b/;
+  var CONT = /^(\s+\S|at |Caused by|\.\.\. \d+ more)/;
+  var logText = "", errorsOnly = false;
+  function drawLogs() {
+    var box = $("ct-logs"); clear(box);
+    var shown = 0, keep = false, last = "";
+    logText.split("\n").forEach(function (raw) {
+      if (!raw) return;
+      var m = LOGTIME.exec(raw), date = m ? m[1] + " " + m[2] + " UTC" : "", t = m ? m[2] : "", msg = m ? m[3] : raw;
+      var more = CONT.test(msg);
+      var kind = LEVEL_ERR.test(msg.slice(0, 200)) ? "err" : LEVEL_WRN.test(msg.slice(0, 200)) ? "wrn" : "";
+      if (more && !kind) kind = last;      // a stack trace line belongs to the line above it
+      if (!more) last = kind;
+      keep = more ? keep : !!kind;
+      if (errorsOnly && !keep) return;
+      var row = el("div", "ll" + (kind ? " " + kind : "") + (more ? " more" : ""));
+      var ts = el("span", "t", more ? "" : t);
+      if (date && !more) ts.title = date;
+      row.appendChild(ts); row.appendChild(el("span", "m", msg));
+      box.appendChild(row); shown++;
+    });
+    if (!shown) box.appendChild(el("span", "muted", errorsOnly ? "No errors or warnings in these lines." : "(no log lines)"));
+    box.scrollTop = box.scrollHeight;   // newest at the bottom, in view
+  }
+  $("ct-errors").addEventListener("click", function () {
+    errorsOnly = !errorsOnly; this.setAttribute("aria-pressed", String(errorsOnly)); drawLogs();
+  });
+  $("ct-wrap").addEventListener("click", function () {
+    var on = this.getAttribute("aria-pressed") !== "true";
+    this.setAttribute("aria-pressed", String(on)); $("ct-logs").classList.toggle("nowrap", !on);
+  });
+
   function openContainer(host, c) {
     chosen = { host: host, c: c };
+    $("map-side").classList.add("wide");
     $("problems-pane").hidden = true;
     $("container-pane").hidden = false;
     $("ct-where").textContent = host + " · container";
@@ -1030,21 +1140,21 @@ JS = r'''"use strict";
     $("ct-image").textContent = c.image || "?";
     $("ct-restarts").textContent = String(c.restarts || 0);
     $("ct-started").textContent = c.started ? c.started.replace("T", " ").slice(0, 16) + " UTC" : "?";
-    $("ct-logs").textContent = "Loading...";
+    logText = ""; clear($("ct-logs")); $("ct-logs").appendChild(el("span", "muted", "Loading..."));
     clear($("ct-changes"));
     $("ct-changes").appendChild(el("p", "muted", "Loading..."));
     drawMap();
     api("GET", "/api/container?host=" + encodeURIComponent(host) + "&name=" + encodeURIComponent(c.name)).then(function (d) {
       if (!chosen || chosen.c.name !== c.name) return;
-      $("ct-logs").textContent = d.logs || "(no log lines)";
+      logText = d.logs || ""; drawLogs();
       var box = $("ct-changes"); clear(box);
       if (!d.changes.length) box.appendChild(el("p", "muted", "Nothing recorded."));
       d.changes.forEach(function (e) {
         var p = el("p"); p.appendChild(el("span", "muted mono", clock(e.time) + "  ")); p.appendChild(document.createTextNode(e.text)); box.appendChild(p);
       });
-    }).catch(function (err) { $("ct-logs").textContent = err.message; clear($("ct-changes")); });
+    }).catch(function (err) { logText = ""; clear($("ct-logs")); $("ct-logs").appendChild(el("span", "warn", err.message)); clear($("ct-changes")); });
   }
-  $("ct-close").addEventListener("click", function () { chosen = null; $("problems-pane").hidden = false; $("container-pane").hidden = true; drawMap(); });
+  $("ct-close").addEventListener("click", function () { chosen = null; $("map-side").classList.remove("wide"); $("problems-pane").hidden = false; $("container-pane").hidden = true; drawMap(); });
   $("ct-trace").addEventListener("click", function () {
     if (!chosen) return;
     traceThis("Container " + chosen.c.name + " on " + chosen.host + " is " + (chosen.c.status || chosen.c.state) + ". What is wrong with it?", chosen.host);
@@ -1149,64 +1259,151 @@ JS = r'''"use strict";
   each("[data-hours]", function (b) { b.addEventListener("click", function () { hours = Number(b.dataset.hours); loadChanges(); }); });
   $("changes-find").addEventListener("input", function () { if (changes) drawChanges(); });
 
-  // ================= Console =================
-  var feed = null, feedAt = 0;
-  function drawConsole() {
+  // ================= Top bar: status on every view =================
+  function late(h) { return !h || !h.checked || Date.now() / 1000 - h.checked > 3 * (h.every || 60); }
+  function drawTop(unreachable) {
+    var h = health, pill = $("status-pill");
+    if (!h) { pill.hidden = true; return; }
+    pill.hidden = false; clear(pill);
+    var n = h.problems.length;
+    if (unreachable || h.failed) {
+      pill.className = "pill bad"; pill.appendChild(el("span", "", "▲ checks failing"));
+    } else if (n) {
+      pill.className = "pill bad"; pill.appendChild(el("span", "", "▲")); pill.appendChild(el("b", "", String(n)));
+      pill.appendChild(el("span", "pw", "need" + (n === 1 ? "s" : "") + " a look"));
+    } else {
+      pill.className = "pill good"; pill.appendChild(el("span", "", "●")); pill.appendChild(el("b", "", "All clear"));
+    }
+    $("top-checked").textContent = h.checked ? "checked " + ago(h.checked) + " ago" : "";
+    $("top-checked").className = "muted small checked-note" + (late(h) ? " late" : "");
+    var running = h.problems.filter(function (p) { return p.trace && (p.trace.state === "running" || p.trace.state === "waiting"); }).length + (busy ? 1 : 0);
+    $("trace-live").hidden = !running;
+    $("trace-live").querySelector("b").textContent = running;
+  }
+  $("status-pill").addEventListener("click", function () { show("map"); });
+
+  // ================= Wall screen =================
+  var feed = null, feedAt = 0, peekTimer = null;
+  function drawWall() {
     if (!health || !me) return;
     var h = health, n = h.problems.length;
-    $("console-watching").textContent = "─●─────●─────●─────▶ watching " + me.hosts.length + (me.hosts.length === 1 ? " host" : " hosts")
-      + (h.clusters.length ? " · " + h.clusters.length + (h.clusters.length === 1 ? " cluster" : " clusters") : "");
-    $("console-status").className = "card status" + (n ? " hot" : "");
-    $("console-count").textContent = n;
-    $("console-words").textContent = n ? (n === 1 ? "problem right now" : "problems right now") : "all well";
-    $("console-words").className = n ? "warn" : "okc";
-    var oldest = h.problems.filter(function (p) { return !p.known; }).map(function (p) { return p.since; }).sort()[0];
-    $("console-oldest").textContent = n ? (oldest ? "oldest started " + clock(oldest) + " (" + ago(oldest) + ")" : "open since before the page started") : "checked " + (h.checked ? ago(h.checked) + " ago" : "soon");
+    $("wall-state").className = "state " + (h.failed ? "bad" : n ? "bad" : "good");
+    $("wall-words").textContent = h.failed ? "Checks are failing" : n ? n + " need" + (n === 1 ? "s" : "") + " a look" : "All clear";
+    $("wall-checked").textContent = (h.checked ? "checked " + ago(h.checked) + " ago" : "not checked yet") + (late(h) ? " · checks have stopped" : "");
+    $("wall-checked").className = late(h) ? "late" : "";
+    tick();
+    // Kubernetes: the clusters themselves; logins (Supervisor, vSphere namespace) only when they need you
+    var k = $("wall-k8s"); clear(k);
+    var shown = 0, quiet = 0;
+    (h.clusters || []).forEach(function (c) {
+      var wants = c.role === "vks" || c.role === "cluster" || c.role === "" || c.problems || c.expired;
+      if (!wants) { quiet += 1; return; }
+      shown += 1;
+      k.appendChild(wallCluster(c));
+    });
+    $("wall-k8s-block").hidden = !(h.clusters || []).length;
+    $("wall-k8s-more").textContent = quiet ? "+ " + quiet + " Supervisor and vSphere namespace login" + (quiet === 1 ? "" : "s") + ", nothing wrong" : "";
+    var hc = $("wall-hosts"); clear(hc);
+    (h.hosts || []).forEach(function (host) { hc.appendChild(wallHost(host)); });
+    // needs a look
+    var need = $("wall-need"); clear(need);
+    if (!n) {
+      var ok = el("div", "wcard"); ok.appendChild(el("span", "nm okc", "Nothing needs a look"));
+      var last = ((feed && feed.events) || []).filter(function (e) { return e.kind === "cleared"; })[0];
+      if (last) ok.appendChild(el("span", "ln", "Last problem cleared at " + clock(last.time) + ": " + last.text));
+      need.appendChild(ok);
+    }
+    h.problems.slice(0, 6).forEach(function (p) {
+      var item = el("div", "nitem");
+      item.appendChild(el("span", "t1", p.text));
+      item.appendChild(el("span", "t2", (p.lane ? p.lane + " · " : "") + (p.known ? "open since before the page started" : "open for " + ago(p.since))));
+      var t = p.trace;
+      if (t) item.appendChild(el("span", "t3", {
+        waiting: "Auto-trace waiting for its turn…", running: "Tracing now…",
+        done: t.cause ? "Traced: " + short(t.cause, 160) : "Traced: no cause found",
+        limit: "Not traced: the hourly auto-trace limit is reached", failed: "Auto-trace failed"
+      }[t.state] || ""));
+      else if (p.link) item.appendChild(el("span", "t3", "← " + linkText(p.link)));
+      need.appendChild(item);
+    });
+    if (n > 6) need.appendChild(el("p", "muted small", "+ " + (n - 6) + " more on the Map"));
     if (Date.now() - feedAt > 25000) {
       feedAt = Date.now();
-      api("GET", "/api/changes?hours=6").then(function (d) { feed = d; drawConsoleRest(); }).catch(function () {});
+      api("GET", "/api/changes?hours=1").then(function (d) { feed = d; drawRecent(); }).catch(function () {});
     }
-    drawConsoleRest();
+    drawRecent();
   }
-  function drawConsoleRest() {
-    var h = health, box = $("console-lanes"); clear(box);
-    ["NAME", "LAST HOUR", "STATE"].forEach(function (t) { box.appendChild(el("span", "muted", t)); });
-    var lanes = me.hosts.concat(h.clusters.filter(function (c) { return c.kind === "Kubernetes"; }).map(function (c) { return c.name; }));
-    var now = Math.floor(Date.now() / 1000);
-    lanes.forEach(function (lane) {
-      box.appendChild(el("span", "", lane));
-      var bars = el("span", "bars"), counts = [], hot = [], top = 1;
-      for (var i = 0; i < 12; i += 1) { counts.push(0); hot.push(false); }
-      ((feed && feed.events) || []).forEach(function (e) {
-        var slot = 11 - Math.floor((now - e.time) / 300);
-        if (e.lane === lane && slot >= 0 && slot < 12) { counts[slot] += 1; if (e.kind === "problem") hot[slot] = true; }
-      });
-      counts.forEach(function (c) { top = Math.max(top, c); });
-      counts.forEach(function (c, i) { var s = el("span", hot[i] ? "hot" : ""); s.style.height = (c ? 20 + c / top * 80 : 8) + "%"; bars.appendChild(s); });
-      bars.setAttribute("aria-label", counts.reduce(function (a, b) { return a + b; }, 0) + " events in the last hour");
-      box.appendChild(bars);
-      var n = laneProblems(lane), host = (h.hosts || []).filter(function (x) { return x.name === lane; })[0];
-      var state = n ? "▲ " + n + (n === 1 ? " problem" : " problems") : "● ok";
-      if (host && host.containers) state += " · " + host.containers.filter(function (c) { return c.state === "running"; }).length + "/" + host.containers.length;
-      if (host && host.error) state = "▲ not answering";
-      box.appendChild(el("span", n || (host && host.error) ? "warn" : "okc", state));
-    });
-    var f = $("console-feed"); clear(f);
-    var rows = ((feed && feed.events) || []).slice(0, 40);
-    if (!rows.length) f.appendChild(el("div", "muted", feed ? "Nothing in the last 6 hours." : "Loading..."));
+  function wallCard(kind, name, state, cls) {
+    var card = el("div", "wcard" + (cls ? " " + cls : ""));
+    card.appendChild(el("span", "kind", kind));
+    var top = el("div", "top2");
+    top.appendChild(el("span", "nm", name));
+    top.appendChild(el("span", "st " + (cls ? "warn" : state.charAt(0) === "○" ? "muted" : "okc"), state));
+    card.appendChild(top);
+    return card;
+  }
+  function bigNumber(card, number, words) {
+    var b = el("span", "big", number + " "); b.appendChild(el("small", "", words)); card.appendChild(b);
+  }
+  function wallCluster(c) {
+    var ROLE_WALL = { supervisor: "Supervisor", namespace: "vSphere namespace", cluster: "Cluster", vks: "VKS cluster" };
+    var state = c.problems ? "▲ " + c.problems : c.expired ? "login expired" : c.paused ? "paused" : c.blind ? "○ can't see" : "● ok";
+    var card = wallCard(ROLE_WALL[c.role] || c.kind, c.name, state, c.problems ? "hot" : c.expired || c.paused ? "stale" : "");
+    var m = /(\d+) of (\d+) machines running/.exec(c.line), k = /(\d+) nodes?, (\d+) pods/.exec(c.line);
+    if (m) bigNumber(card, m[1] + "/" + m[2], "machines");
+    else if (k) bigNumber(card, k[2], "pods · " + k[1] + " nodes");
+    var line = c.expired ? "run kubectl vsphere login again" : c.paused ? "paused: VMware won't repair, scale or upgrade it" : "";
+    if (!line && c.spaces && c.spaces.length) {
+      line = c.spaces.filter(function (s) { return s.problems || !SYSTEM.test(s.name); }).slice(0, 4)
+        .map(function (s) { return s.name + " " + s.pods + (s.problems ? " ▲" + s.problems : ""); }).join(" · ");
+    }
+    if (!line && !m && !k) line = c.line.replace(/^vSphere namespace [^:]+: /, "");
+    if (line) card.appendChild(el("span", "ln", line));
+    return card;
+  }
+  var SYSTEM = /^(kube-|vmware-system-|tkg-|tanzu-|secretgen-|kapp-|cert-manager$|ingress-nginx$)/;
+  function wallHost(host) {
+    var n = laneProblems(host.name), list = host.containers || [];
+    var card = wallCard(host.role === "hub" ? "Hub" : host.role ? "Agent" : "Host", host.name,
+      host.error ? "▲ not answering" : n ? "▲ " + n : "● ok", host.error || n ? "hot" : "");
+    var running = list.filter(function (c) { return c.state === "running"; }).length;
+    var worst = (host.disks || []).slice().sort(function (a, b) { return b[0] - a[0]; })[0];
+    card.appendChild(el("span", "ln", host.error ? host.error : running + " of " + list.length + " running" + (worst ? " · disk " + worst[0] + "%" : "")));
+    if (list.length) {
+      var sq = el("div", "wsq");
+      list.forEach(function (c) { var i = el("i", c.state === "running" ? "" : c.state === "restarting" || c.state === "unhealthy" ? "u" : "x"); i.title = c.name; sq.appendChild(i); });
+      card.appendChild(sq);
+    }
+    return card;
+  }
+  function drawRecent() {
+    var box = $("wall-recent"); clear(box);
+    var now = Date.now() / 1000;
+    var rows = ((feed && feed.events) || []).filter(function (e) { return now - e.time < 3600; }).slice(0, 10);
+    if (!rows.length) box.appendChild(el("div", "", feed ? "Nothing happened in the last hour." : "Loading…"));
     rows.forEach(function (e) {
-      var line = el("div");
-      line.appendChild(el("span", "muted", clock(e.time) + "  "));
-      line.appendChild(el("span", e.kind === "problem" ? "warn" : "", (e.lane || "") + "  "));
-      line.appendChild(el("span", e.kind === "problem" ? "warn" : e.kind === "cleared" ? "okc" : e.kind === "traced" ? "traceline" : "",
-        ({ problem: "▲ ", cleared: "✓ ", traced: "◆ auto-trace: " }[e.kind] || "● ") + e.text));
-      if (e.link) line.appendChild(el("span", "linkline" + (e.link.strength === "maybe" ? " maybe" : ""), "  ← " + e.link.text));
-      f.appendChild(line);
+      var line = el("div", e.kind === "problem" ? "warn" : e.kind === "cleared" ? "okc" : "");
+      line.appendChild(el("span", "tm", clock(e.time).slice(-5)));
+      line.appendChild(document.createTextNode((e.lane ? e.lane + ": " : "") + ({ problem: "▲ ", cleared: "✓ ", traced: "◆ " }[e.kind] || "") + e.text));
+      box.appendChild(line);
     });
   }
-  $("full-screen").addEventListener("click", function () {
-    var v = $("view-console");
-    if (document.fullscreenElement) document.exitFullscreen(); else if (v.requestFullscreen) v.requestFullscreen();
+  function tick() {
+    var d = new Date();
+    $("wall-clock").textContent = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+  }
+  setInterval(function () { if (view === "wall") tick(); }, 5000);
+  $("wall-open").addEventListener("click", function () {
+    show("wall");
+    var v = document.documentElement;
+    if (v.requestFullscreen) v.requestFullscreen().catch(function () {});   // optional: the wall works without it
+  });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && view === "wall") show("map"); });
+  document.addEventListener("mousemove", function () {
+    if (view !== "wall") return;
+    document.body.classList.add("peek");
+    clearTimeout(peekTimer);
+    peekTimer = setTimeout(function () { document.body.classList.remove("peek"); }, 3000);
   });
 
   // ================= Library =================

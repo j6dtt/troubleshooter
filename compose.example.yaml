@@ -1,3 +1,6 @@
+# Copy this to compose.yaml and edit the settings there:
+#   cp compose.example.yaml compose.yaml
+# compose.yaml is this host's own and is never in git.
 # ===================== SETTINGS =====================
 # Runtime image: bump the tag only when the Dockerfile
 # changes. Dev builds it; the air-gapped host loads it

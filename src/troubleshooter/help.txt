@@ -6,6 +6,7 @@ only after you type yes. It never runs shell commands.
 
 START
 
+  cp compose.example.yaml compose.yaml    the first time only
   docker compose up -d     start it (once)
   ./ts check               test every connection
   ./ts                     chat
@@ -297,17 +298,25 @@ The hub serves a page at https://<hub host>:<web-port>.
 
 The page looks only: it never changes anything. Fixes stay in ./ts.
 
+  Map            the first page: each host's containers as
+                 squares, and each cluster; select a square for its
+                 logs and changes. Open problems are listed beside it.
   Trace          the chat, drawn as a trail: symptom, evidence,
                  cause, fix. Select a step to see its full output.
-  Map            each host's containers as squares, and each
-                 cluster; select a square for its logs and changes.
-                 Open problems are listed beside it.
   What changed   one lane per host and cluster: changes, problems
                  and gaps in recording. Pick some to trace together.
-  Console        a status wall: problem count, last hour per host,
-                 live feed. Full screen for a big monitor.
   Library        cases, runbooks and reports; cases can be edited
                  and deleted
+
+The top bar shows, on every page, how many problems need a look
+(select it for the Map), when the last check ran (orange if checks
+stopped), and a live dot on Trace while traces run.
+
+WALL SCREEN: the Wall button, or the address ending in #wall. For
+a TV: big state ("3 need a look" or "All clear"), clock, every
+cluster and host, what needs a look with what auto-trace found,
+and the last hour. Look only; refreshed every 30 s. The menu
+hides; a mouse move shows it, Esc goes back to the Map.
 
 "Trace this" on the Map, and "Trace these" in What changed, open
 the Trace with the question written and the host chosen.
@@ -341,7 +350,7 @@ most 20 MB a host), so a restart keeps them. Read them:
   /traces 3                open trace 3 as this chat: ask more,
                            or ask to fix it (fixes ask you first)
   the page (hub)           Map: Open trace; What changed: the
-                           change -> problem line; Console
+                           change -> problem line; Wall
 
 ANONYMIZE
 

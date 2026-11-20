@@ -2,7 +2,8 @@
 # Pack everything the air-gapped host needs into dist/troubleshooter-<version>.tar:
 #   image.tar.xz  runtime image (docker load)
 #   src/          the app code, mounted into the container
-#   compose.yaml  with the prod model block switched on, and no build step
+#   compose.yaml  from compose.example.yaml, with the prod model block
+#                 switched on, and no build step
 #   ts, README.md, INSTALL.txt
 # No model weights: prod already serves its models. No secrets: .env stays behind.
 set -eu
@@ -34,7 +35,7 @@ sed -e '/^    build: \.$/d' \
     -e 's|^  llm-model: &llm-model nvidia/nemotron-3.5-super-vl.*|  #|' \
     -e 's|^  # llm-url:   &llm-url http://<vllm-host>|  llm-url:   \&llm-url http://<vllm-host>|' \
     -e 's|^  # llm-model: &llm-model nvidia/nemotron-3-super|  llm-model: \&llm-model nvidia/nemotron-3-super|' \
-    compose.yaml > "$out/compose.yaml"
+    compose.example.yaml > "$out/compose.yaml"
 cp ts README.md "$out/"
 cp -r k8s "$out/"
 cp scripts/make-kubeconfig.sh "$out/scripts/"
