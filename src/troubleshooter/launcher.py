@@ -7,6 +7,8 @@ on Python 3.6 or newer, as found on older hosts.
     They stop when this ends.
   - ./ts setup: makes the key and certificate the hosts use to talk to each other, into .env and
     ./certs. ./ts user: the accounts of the web page, into .env. Neither is ever shown.
+  - ./ts login: renews every kubectl vsphere login with one password. The password goes to kubectl
+    only, for that moment; it is never stored or shown.
   - After a chat: copies the cases you saved with /case to runbooks/_cases/<host>/, as you, so
     every host that runs from this folder sees them.
   - ./ts watch: stopping it, or losing its terminal, stops the watch in the container too.
@@ -40,6 +42,10 @@ USER = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 ROUNDS = 200000
 CONTEXTS = '{range .contexts[*]}{.name}{"\\t"}{.context.namespace}{"\\n"}{end}'
 SERVING = re.compile(r"127\.0\.0\.1:(\d+)")
+WCP = re.compile(r"^wcp:(\[[^\]]+\]|[^:]+):(.+)$")  # the user kubectl vsphere login writes: wcp:<server>:<name>
+KUBE_HOME = re.compile(r'^\s*kube-home:\s*&kube-home\s+"([^"]*)"', re.M)
+REFUSED = re.compile(r"password|credential|unauthori[sz]ed|invalid|locked|denied", re.I)
+SOON = 2 * 3600      # a login that ends within this is said when ./ts starts
 
 
 def safe(text):
@@ -53,6 +59,208 @@ def quiet(argv):
         return subprocess.check_output(argv, stderr=subprocess.DEVNULL, universal_newlines=True)
     except (OSError, subprocess.CalledProcessError):
         return ""
+
+
+def token_end(token):
+    """When a login token ends (epoch seconds), as the token itself says; 0 when it does not say."""
+    try:
+        part = str(token).split(".")[1]
+        end = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode("utf-8")).get("exp")
+        return float(end) if isinstance(end, (int, float)) and not isinstance(end, bool) and end > 0 else 0
+    except (IndexError, ValueError, AttributeError, TypeError):
+        return 0
+
+
+def kube_view(raw=False, env=None):
+    """The kubeconfig as kubectl reads it. raw=True has the tokens: used only for when they end."""
+    try:
+        out = subprocess.check_output(["kubectl", "config", "view", "-o", "json"] + (["--raw"] if raw else []),
+                                      stderr=subprocess.DEVNULL, universal_newlines=True, env=env)
+        return json.loads(out) or {}
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return {}
+
+
+def login_ends(env=None):
+    """{context: when its login ends}, only for the logins that say."""
+    cfg = kube_view(raw=True, env=env)
+    ends = {u.get("name"): token_end((u.get("user") or {}).get("token") or "") for u in cfg.get("users") or []}
+    found = {}
+    for c in cfg.get("contexts") or []:
+        end = ends.get((c.get("context") or {}).get("user")) or 0
+        if end:
+            found[c.get("name")] = end
+    return found
+
+
+def span(seconds):
+    seconds = max(0, int(seconds))
+    return "{} min".format(max(1, seconds // 60)) if seconds < 5400 else "{} h".format(int(round(seconds / 3600.0)))
+
+
+def ending_soon(ends, now=None):
+    """One line about logins that have ended or end soon, or "" when none do."""
+    now = now or time.time()
+    over = sorted(c for c, end in ends.items() if end <= now)
+    soon = sorted((end, c) for c, end in ends.items() if now < end <= now + SOON)
+    parts = []
+    if over:
+        parts.append("The login to {} has ended.".format(", ".join(over)))
+    if soon:
+        parts.append("The login to {} ends in {}.".format(", ".join(c for _, c in soon), span(soon[0][0] - now)))
+    return " ".join(parts) + " ./ts login renews every login with one password." if parts else ""
+
+
+def login_plan(cfg):
+    """What kubectl vsphere login wrote in a kubeconfig, as what to log in to again:
+    ([{server, user, insecure, contexts, namespaces}] for each Supervisor, [{name, user}] for each VKS cluster).
+    A Supervisor's contexts share one cluster entry: its own (named after the server) and one per vSphere
+    namespace. A VKS cluster has one context, named after the cluster."""
+    servers = {c.get("name"): c.get("cluster") or {} for c in cfg.get("clusters") or []}
+    users = {u.get("name"): WCP.match(u.get("name") or "") for u in cfg.get("users") or []}
+    groups = {}
+    for c in cfg.get("contexts") or []:
+        ctx = c.get("context") or {}
+        who = users.get(ctx.get("user"))
+        if who and ctx.get("cluster") in servers:
+            groups.setdefault((ctx["cluster"], ctx["user"]), []).append((c.get("name") or "", ctx.get("namespace") or ""))
+    supervisors, clusters = [], []
+    for (entry, user), members in sorted(groups.items()):
+        who, server = users[user], servers[entry]
+        host = who.group(1).strip("[]")
+        address = re.sub(r"^https?://|[:/]\d*/?$", "", server.get("server") or "")
+        names = [name for name, _ in members]
+        if len(members) > 1 or any(space for _, space in members) or names[0] in (host, address, entry):
+            supervisors.append({"server": host, "user": who.group(2), "insecure": bool(server.get("insecure-skip-tls-verify")),
+                                "contexts": sorted(names), "namespaces": sorted({(name, space) for name, space in members if space})})
+        else:
+            clusters.append({"name": names[0], "user": who.group(2)})
+    return supervisors, clusters
+
+
+def vsphere_login(server, user, password, insecure, env, namespace="", cluster=""):
+    """(True, "") or (False, why). The password is given to kubectl in its environment, never on its command line."""
+    argv = ["kubectl", "vsphere", "login", "--server=" + server, "--vsphere-username", user]
+    if insecure:
+        argv.append("--insecure-skip-tls-verify")
+    if cluster:
+        argv += ["--tanzu-kubernetes-cluster-namespace", namespace, "--tanzu-kubernetes-cluster-name", cluster]
+    try:
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             universal_newlines=True, env=dict(env, KUBECTL_VSPHERE_PASSWORD=password))
+        try:
+            out = p.communicate(timeout=90)[0]
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            return False, "no answer within 90 seconds"
+    except OSError as e:
+        return False, str(e)
+    if p.returncode == 0:
+        return True, ""
+    said = [row.strip() for row in (out or "").replace(password, "***").splitlines() if row.strip()]
+    return False, said[-1][:300] if said else "kubectl vsphere login failed with exit code {}".format(p.returncode)
+
+
+def login_files():
+    """[(label, environment)] of each kubeconfig to renew: yours, and kube-home's when that is another file."""
+    mine = (os.environ.get("KUBECONFIG") or "").split(os.pathsep)[0] or os.path.join(os.path.expanduser("~"), ".kube", "config")
+    found = [(mine, dict(os.environ))]
+    try:
+        with io.open(os.path.join(HOME, "compose.yaml"), encoding="utf-8") as f:
+            m = KUBE_HOME.search(f.read())
+    except (OSError, UnicodeDecodeError):
+        m = None
+    if m and m.group(1):
+        other = os.path.join(os.path.abspath(os.path.join(HOME, os.path.expanduser(m.group(1)))), "config")
+        if os.path.isfile(other) and os.path.realpath(other) != os.path.realpath(mine):
+            found.append((other, dict(os.environ, KUBECONFIG=other)))
+    return found
+
+
+def login(args):
+    """./ts login: every kubectl vsphere login again, with one password for each user name."""
+    if kubernetes_off():
+        print('Kubernetes is "off" in compose.yaml: there are no logins to renew.')
+        return 1
+    if not shutil.which("kubectl") or not (shutil.which("kubectl-vsphere") or quiet(["kubectl", "vsphere", "version"])):
+        print("This needs kubectl and its vsphere plugin (kubectl-vsphere) on this host.")
+        return 1
+    passwords, done, failed, stop = {}, 0, 0, False
+    for label, env in login_files():
+        cfg = kube_view(env=env)
+        supervisors, clusters = login_plan(cfg)
+        if not supervisors and not clusters:
+            print("{}: no kubectl vsphere login found there. Log in once by hand; ./ts login renews it from then on.".format(label))
+            continue
+        print("Logins to renew in {}:".format(label))
+        for s in supervisors:
+            print("  Supervisor {} as {}  (contexts: {})".format(s["server"], s["user"], ", ".join(s["contexts"])))
+        for c in clusters:
+            print("  VKS cluster {} as {}".format(c["name"], c["user"]))
+        current = (cfg.get("current-context") or "")
+        ok_supervisors = []
+        for s in supervisors:
+            if s["user"] not in passwords:
+                passwords[s["user"]] = getpass.getpass("Password for {}: ".format(s["user"]))
+            good, why = vsphere_login(s["server"], s["user"], passwords[s["user"]], s["insecure"], env)
+            if good:
+                done += 1
+                ok_supervisors.append(s)
+                print("Logged in to Supervisor {}.".format(s["server"]))
+                continue
+            failed += 1
+            print("Could not log in to Supervisor {}: {}".format(s["server"], why))
+            if REFUSED.search(why):
+                stop = True
+                print("Stopped here: trying the same password again elsewhere could lock the account.")
+                break
+        if not stop and clusters:
+            homes = cluster_homes(ok_supervisors, env)
+            for c in clusters:
+                home = homes.get(c["name"])
+                if not home:
+                    failed += 1
+                    print("VKS cluster {}: no vSphere namespace this login can see holds it. Log in to it by hand.".format(c["name"]))
+                    continue
+                s, namespace = home
+                good, why = vsphere_login(s["server"], s["user"], passwords[s["user"]], s["insecure"], env, namespace, c["name"])
+                if good:
+                    done += 1
+                    print("Logged in to VKS cluster {} (vSphere namespace {}).".format(c["name"], namespace))
+                else:
+                    failed += 1
+                    print("Could not log in to VKS cluster {}: {}".format(c["name"], why))
+        if current and done:  # kubectl vsphere login switches the current context: put yours back
+            subprocess.call(["kubectl", "config", "use-context", current], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        if stop:
+            break
+    passwords.clear()
+    if done:
+        ends = [end for _, env in login_files() for end in login_ends(env).values() if end > time.time()]
+        until = " They last until about {}.".format(time.strftime("%H:%M", time.localtime(min(ends)))) if ends else ""
+        print("{} login{} renewed.{} The page shows them within a minute; no restart.".format(done, "" if done == 1 else "s", until))
+    if failed:
+        print("{} login{} not renewed.".format(failed, "" if failed == 1 else "s"))
+    return 0 if done and not failed else 1
+
+
+def cluster_homes(supervisors, env):
+    """{VKS cluster: (its Supervisor, its vSphere namespace)}, asked from each namespace a fresh login can see."""
+    found = {}
+    for s in supervisors:
+        cfg = kube_view(env=env)  # read again: a login can bring new namespaces
+        fresh = next((x for x in login_plan(cfg)[0] if x["server"] == s["server"] and x["user"] == s["user"]), s)
+        for context, namespace in fresh["namespaces"]:
+            try:
+                names = subprocess.check_output(
+                    ["kubectl", "--context", context, "--request-timeout=20s", "get", "clusters.cluster.x-k8s.io", "-n", namespace,
+                     "-o", "jsonpath={.items[*].metadata.name}"], stderr=subprocess.DEVNULL, universal_newlines=True, env=env)
+            except (OSError, subprocess.CalledProcessError):
+                continue
+            for name in names.split():
+                found.setdefault(name, (s, namespace))
+    return found
 
 
 class Proxies:
@@ -69,6 +277,10 @@ class Proxies:
         # In the foreground first: a login plugin may need to ask for a password.
         if self.current and subprocess.call(["kubectl", "get", "--raw", "/version"], stdout=subprocess.DEVNULL) != 0:
             print("Not logged in to {}. Log in from another terminal; no need to restart.".format(self.current))
+        ends = login_ends()
+        said = ending_soon(ends)
+        if said:
+            print(said)
         self.folder = tempfile.mkdtemp()
         parts = []
         for n, row in enumerate(rows):
@@ -80,7 +292,7 @@ class Proxies:
             self.procs.append(proc)
             port = self._port(proc, log)
             if port:
-                parts.append("{}|{}|{};".format(context, port, namespace))
+                parts.append("{}|{}|{}|{};".format(context, port, namespace, int(ends.get(context) or 0)))
             else:
                 print("Skipping context {}: its kubectl proxy did not start.".format(context))
         self.found = "".join(parts)
@@ -430,6 +642,8 @@ def main():
         return setup(args)
     if args[:1] == ["user"]:
         return user(args)
+    if args[:1] == ["login"]:
+        return login(args)
     signals = Signals()
     proxies = Proxies()
     try:

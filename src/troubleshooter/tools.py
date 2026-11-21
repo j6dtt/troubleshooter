@@ -3,6 +3,7 @@
 Every argument is checked here and passed as one fixed argv item. There is no shell and no
 free-form command tool, so a bad argument (or a poisoned log line) can't widen what runs.
 """
+import base64
 import datetime
 import json
 import os
@@ -265,6 +266,7 @@ class Cluster:
     server: str = ""      # set for your own login: the kubectl proxy that ./ts started on the host
     namespace: str = ""   # the context's own namespace, used when none is given
     api: str = ""         # the API server's address, so two contexts on one Supervisor namespace are looked at once
+    expires: float = 0    # when its login token ends (epoch seconds), as the token says; 0 = it does not say
 
 
 def conditions(obj, skip=()):
@@ -286,7 +288,6 @@ def conditions(obj, skip=()):
     return list(found.values())
 
 
-RECENT_UNPAUSE = 7 * 86400
 SPACES_SHOWN = 12
 
 
@@ -308,14 +309,6 @@ def read_namespace_line(row):
              for m in SPACE.finditer(row[len("NAMESPACES "):].split(", and ")[0])]
     more = re.search(r", and (\d+) more$", row)
     return found, int(more[1]) if more else 0
-
-
-def pause_field(obj):
-    """(manager, time in seconds or None) of whoever last wrote spec.paused, from the managed fields; (None, None)."""
-    for f in (obj.get("metadata") or {}).get("managedFields") or []:
-        if "f:paused" in ((f.get("fieldsV1") or {}).get("f:spec") or {}):
-            return f.get("manager") or "unknown tool", when(f.get("time"))
-    return None, None
 
 
 def paused_by(obj):
@@ -374,6 +367,29 @@ def kube_files(kube_dir, kube_home=""):
     return tuple(found)
 
 
+def token_expiry(token):
+    """When a login token ends (epoch seconds), read from the token itself; 0 when it does not say.
+    A vSphere login token says; a service account token from make-kubeconfig.sh has no end."""
+    try:
+        part = str(token).split(".")[1]
+        end = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("exp")
+        return float(end) if isinstance(end, (int, float)) and not isinstance(end, bool) and end > 0 else 0
+    except (IndexError, ValueError, AttributeError, TypeError):
+        return 0
+
+
+def _expiries(path):
+    """{user: when its token ends}. The tokens are read only for their end time and are kept nowhere."""
+    r = run(["kubectl", "config", "view", "--raw", "--kubeconfig", path, "-o", "json"], parsed=True)
+    if not r.ok:
+        return {}
+    try:
+        users = json.loads(r.text).get("users") or []
+    except ValueError:
+        return {}
+    return {u.get("name"): token_expiry((u.get("user") or {}).get("token") or "") for u in users}
+
+
 def _read_kubeconfig(path):
     r = run(["kubectl", "config", "view", "--kubeconfig", path, "-o", "json"], parsed=True)
     if not r.ok:
@@ -393,9 +409,10 @@ def find_clusters(kube_dir, kube_home=""):
     """
     found = {}
     for row in filter(None, os.environ.get("KUBE_PROXIES", "").split(";")):
-        context, port, namespace = (row.split("|") + ["", ""])[:3]
+        context, port, namespace, ends = (row.split("|") + ["", "", ""])[:4]
         cid = re.sub(r"[^A-Za-z0-9_.\-]", "-", context)
-        found[cid] = Cluster(cid, "", context, server=f"http://127.0.0.1:{port}", namespace=namespace)
+        found[cid] = Cluster(cid, "", context, server=f"http://127.0.0.1:{port}", namespace=namespace,
+                             expires=float(ends) if re.fullmatch(r"\d+(\.\d+)?", ends) else 0)
     home = os.path.join(kube_home, "config") if kube_home else ""
     for path, _, _ in kube_files(kube_dir, kube_home):
         cfg = _read_kubeconfig(path)
@@ -404,6 +421,7 @@ def find_clusters(kube_dir, kube_home=""):
         users = {u["name"]: (u.get("user", {}).get("exec") or {}).get("command", "") for u in cfg.get("users") or []}
         apis = {c["name"]: (c.get("cluster") or {}).get("server", "") for c in cfg.get("clusters") or []}
         contexts = cfg.get("contexts") or []
+        ends = _expiries(path)
         stem = os.path.splitext(os.path.basename(path))[0]
         for c in contexts:
             cid = c["name"] if path == home else stem if len(contexts) == 1 else f"{stem}.{c['name']}"
@@ -412,7 +430,8 @@ def find_clusters(kube_dir, kube_home=""):
                 continue
             ctx = c.get("context") or {}
             found[cid] = Cluster(cid, path, c["name"], users.get(ctx.get("user"), ""),
-                                 namespace=ctx.get("namespace") or "", api=apis.get(ctx.get("cluster"), ""))
+                                 namespace=ctx.get("namespace") or "", api=apis.get(ctx.get("cluster"), ""),
+                                 expires=ends.get(ctx.get("user")) or 0)
     for c in found.values():
         if c.server and not c.api:
             c.api = c.server
@@ -1254,13 +1273,7 @@ class Toolbox:
         if paused:
             who = paused_by(c)
             pause = PAUSED + (f" (set by {who})" if who else "") + "; "
-        else:
-            # spec.paused written, now false: someone unpaused it. Said for a week, so a trace can tie it in.
-            who, at = pause_field(c)
-            if who and at and time.time() - at < RECENT_UNPAUSE:
-                stamp = datetime.datetime.fromtimestamp(at, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                pause = f"unpaused: spec.paused set to false by {who} (its last change {stamp}), " \
-                        "so VMware repairs, scales and upgrades it again; "
+        # An unpause is not said here: it is one line in What changed, not a note that stays on the card.
         head = f"VKS CLUSTER {ns}/{cname}" + (f" ({version})" if version else "") \
             + f": {pause}{running} of {len(machines)} machines running; "
         return [head + (f"{len(rows)} need a look" if rows else "nothing wrong found")] + rows[:60]

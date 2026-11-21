@@ -1821,7 +1821,7 @@ class Page(unittest.TestCase):
         self.assertEqual(state["problems"][0]["lane"], self.site.health.box.here)
         self.assertEqual(state["hosts"][0]["name"], self.site.health.box.here)
         self.assertEqual(state["clusters"], [{"name": "vks-a", "kind": "Kubernetes", "line": "3 nodes", "problems": 0,
-                                              "role": "", "expired": False, "paused": False, "blind": False,
+                                              "role": "", "expired": False, "expires": 0, "paused": False, "blind": False,
                                               "context": "", "spaces": [], "more_spaces": 0}])
 
     def test_a_host_that_cannot_say_is_shown_with_the_reason(self):
@@ -2526,17 +2526,15 @@ class PausedVks(unittest.TestCase):
         self.assertIn("unpaused (set by kubectl-patch, its last change 2026-08-10 14:02 UTC);", rows[0])
         self.assertEqual(tools.paused_by(self.cluster(True)), "")
 
-    def test_a_recent_unpause_is_said_with_who_and_when(self):
-        """After an unpause the change is on the cluster itself: a trace can tie it in for a week."""
+    def test_an_unpause_leaves_no_note_on_the_card(self):
+        """The unpause is in What changed; the card says only how the cluster is now."""
         c = self.cluster(False)
         recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3 * 3600))
         c["metadata"]["managedFields"] = [{"manager": "kubectl-patch", "operation": "Update", "time": recent,
                                            "fieldsV1": {"f:spec": {"f:paused": {}}}}]
         rows = tools.Toolbox._vks_cluster(c, self.got(False))
-        self.assertIn(f"unpaused: spec.paused set to false by kubectl-patch (its last change {recent[:10]} ", rows[0])
+        self.assertNotIn("paused", rows[0])
         self.assertIn("1 of 1 machines running; nothing wrong found", rows[0])
-        c["metadata"]["managedFields"][0]["time"] = "2026-01-01T00:00:00Z"  # long ago: not news any more
-        self.assertNotIn("unpaused", tools.Toolbox._vks_cluster(c, self.got(False))[0])
 
     def test_the_record_keeps_the_pause_so_what_changed_shows_it(self):
         old = {"k8s": {"team-a": {"vks": {"cluster team-a/prod1": "Provisioned v1.33.6 paused"}}}}
@@ -2600,6 +2598,109 @@ class KubeHome(unittest.TestCase):
         with mock.patch.object(tools, "_read_kubeconfig", lambda path: one if path.endswith(".yaml") else self.cfg):
             found = tools.find_clusters(self.dir, self.home)
         self.assertEqual(found["team-a"].file, os.path.join(self.dir, "team-a.yaml"))
+
+
+def made_token(end=None):
+    """A token shaped like a login token: three parts, the middle one says when it ends."""
+    import base64
+    claims = {"sub": "someone"} if end is None else {"sub": "someone", "exp": end}
+    return "aaa." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=") + ".zzz"
+
+
+VSPHERE_CONFIG = {
+    "current-context": "team-a",
+    "clusters": [{"name": "10.0.0.1", "cluster": {"server": "https://10.0.0.1:6443", "insecure-skip-tls-verify": True}},
+                 {"name": "10.0.0.9", "cluster": {"server": "https://10.0.0.9:6443"}},
+                 {"name": "other", "cluster": {"server": "https://10.0.0.50:6443"}}],
+    "users": [{"name": "wcp:10.0.0.1:ann@corp.local"}, {"name": "wcp:10.0.0.9:ann@corp.local"}, {"name": "robot"}],
+    "contexts": [{"name": "10.0.0.1", "context": {"cluster": "10.0.0.1", "user": "wcp:10.0.0.1:ann@corp.local"}},
+                 {"name": "team-a", "context": {"cluster": "10.0.0.1", "user": "wcp:10.0.0.1:ann@corp.local", "namespace": "team-a"}},
+                 {"name": "prod1", "context": {"cluster": "10.0.0.9", "user": "wcp:10.0.0.9:ann@corp.local"}},
+                 {"name": "robot", "context": {"cluster": "other", "user": "robot"}}]}
+
+
+class Login(unittest.TestCase):
+    def test_a_token_says_when_it_ends(self):
+        for read in (tools.token_expiry, launcher.token_end):
+            self.assertEqual(read(made_token(1900000000)), 1900000000)
+            for none in (made_token(), "not-a-token", "", "a.b.c", None, made_token("soon")):
+                self.assertEqual(read(none), 0)
+
+    def test_what_to_log_in_to_again_is_read_from_the_kubeconfig(self):
+        supervisors, clusters = launcher.login_plan(VSPHERE_CONFIG)
+        self.assertEqual(len(supervisors), 1)
+        s = supervisors[0]
+        self.assertEqual((s["server"], s["user"], s["insecure"]), ("10.0.0.1", "ann@corp.local", True))
+        self.assertEqual((s["contexts"], s["namespaces"]), (["10.0.0.1", "team-a"], [("team-a", "team-a")]))
+        self.assertEqual(clusters, [{"name": "prod1", "user": "ann@corp.local"}])   # the service account login is left alone
+        self.assertEqual(launcher.login_plan({}), ([], []))
+
+    def test_the_password_goes_to_kubectl_in_its_environment_only(self):
+        seen = {}
+
+        class Fake:
+            returncode = 1
+
+            def __init__(self, argv, **kw):
+                seen["argv"], seen["env"] = argv, kw["env"]
+
+            def communicate(self, timeout=None):
+                return ("Logging in\nerror: wrong password s3cret-pw for ann\n", None)
+        with mock.patch.object(launcher.subprocess, "Popen", Fake):
+            good, why = launcher.vsphere_login("10.0.0.1", "ann@corp.local", "s3cret-pw", True, {}, "team-a", "prod1")
+        self.assertFalse(good)
+        self.assertNotIn("s3cret-pw", " ".join(seen["argv"]) + why)
+        self.assertEqual(seen["env"]["KUBECTL_VSPHERE_PASSWORD"], "s3cret-pw")
+        self.assertIn("--insecure-skip-tls-verify", seen["argv"])
+        self.assertEqual(seen["argv"][-4:], ["--tanzu-kubernetes-cluster-namespace", "team-a", "--tanzu-kubernetes-cluster-name", "prod1"])
+
+    def run_login(self, answers):
+        calls, asked, out = [], [], io.StringIO()
+
+        def fake_login(server, user, password, insecure, env, namespace="", cluster=""):
+            calls.append(cluster or server)
+            return answers.get(cluster or server, (True, ""))
+        with mock.patch.object(launcher, "kubernetes_off", lambda: False), mock.patch.object(launcher.shutil, "which", lambda n: "/bin/" + n), \
+                mock.patch.object(launcher, "login_files", lambda: [("~/.kube/config", {})]), \
+                mock.patch.object(launcher, "kube_view", lambda raw=False, env=None: VSPHERE_CONFIG), \
+                mock.patch.object(launcher, "login_ends", lambda env=None: {}), \
+                mock.patch.object(launcher, "vsphere_login", fake_login), \
+                mock.patch.object(launcher, "cluster_homes", lambda sup, env: {"prod1": (sup[0], "team-a")} if sup else {}), \
+                mock.patch.object(launcher.subprocess, "call", lambda argv, **kw: calls.append("back to " + argv[-1]) or 0), \
+                mock.patch.object(launcher.getpass, "getpass", lambda prompt: asked.append(prompt) or "s3cret-pw"), redirect_stdout(out):
+            code = launcher.login(["login"])
+        return code, calls, asked, out.getvalue()
+
+    def test_one_password_renews_every_login_and_puts_your_context_back(self):
+        code, calls, asked, said = self.run_login({})
+        self.assertEqual((code, calls), (0, ["10.0.0.1", "prod1", "back to team-a"]))
+        self.assertEqual(asked, ["Password for ann@corp.local: "])
+        self.assertIn("2 logins renewed.", said)
+        self.assertIn("Logged in to VKS cluster prod1 (vSphere namespace team-a).", said)
+        self.assertNotIn("s3cret-pw", said)
+
+    def test_a_refused_password_is_not_tried_again(self):
+        code, calls, asked, said = self.run_login({"10.0.0.1": (False, "Invalid credentials")})
+        self.assertEqual((code, calls), (1, ["10.0.0.1"]))   # the cluster login is never tried: no lockout
+        self.assertIn("could lock the account", said)
+
+    def test_ts_says_at_the_start_when_a_login_ends_soon(self):
+        now = 1000000
+        self.assertEqual(launcher.ending_soon({"a": now + 9 * 3600}, now), "")
+        said = launcher.ending_soon({"team-a": now + 1800, "prod1": now - 5, "later": now + 9 * 3600}, now)
+        self.assertEqual(said, "The login to prod1 has ended. The login to team-a ends in 30 min. "
+                               "./ts login renews every login with one password.")
+
+    def test_your_own_logins_end_time_reaches_the_container(self):
+        with mock.patch.dict(os.environ, {"KUBE_PROXIES": "team-a|40001|team-a|1900000000;old|40002|;"}):
+            found = tools.find_clusters("/none")
+        self.assertEqual((found["team-a"].expires, found["old"].expires), (1900000000, 0))
+
+    def test_the_page_is_told_when_a_login_ends(self):
+        self.assertIn('"expires": c.get("expires", 0)', inspect.getsource(autotrace))
+        self.assertIn('lines[-1]["expires"]', inspect.getsource(watch))
+        self.assertIn("login ends in", webpage.JS)
+        self.assertIn('id="top-login"', webpage.INDEX)
 
 
 if __name__ == "__main__":

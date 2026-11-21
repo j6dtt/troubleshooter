@@ -137,6 +137,7 @@ def kube_survey(box):
         if lines and lines[-1]["kind"] == "Kubernetes":
             lines[-1]["role"] = kinds[cid]
             lines[-1]["expired"] = part.splitlines()[0].endswith(EXPIRED)
+            lines[-1]["expires"] = getattr(box.clusters.get(cid), "expires", 0) or 0   # 0: the token has no end, or does not say
             # a namespace where this login sees nothing: not healthy, just unknown
             rows = part.splitlines()
             spaces = next((r for r in rows[1:] if r.startswith("NAMESPACES ")), "")

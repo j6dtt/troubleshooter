@@ -39,6 +39,7 @@ INDEX = r'''<!doctype html>
     </nav>
     <span class="grow"></span>
     <button type="button" id="status-pill" class="pill" title="Go to the Map"></button>
+    <span id="top-login" class="small checked-note late" hidden></span>
     <span id="top-checked" class="muted small checked-note"></span>
     <button type="button" id="wall-open" class="wallbtn" title="Show the wall screen: big, look-only, for a TV"><svg class="ic" viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="3" width="16" height="11" rx="1.5"/><path d="M7 17h6 M10 14v3"/></svg>Wall</button>
     <span id="who" class="chip mono"></span>
@@ -543,7 +544,7 @@ body.walling.peek .top{transform:none}
 @media (max-width:720px){.side{position:static;max-height:none}.bubble{max-width:100%}.ask{position:static}
 .link{display:none}.trail{flex-direction:column;align-items:flex-start}.view{padding:14px 16px}
  .top{gap:10px;padding:0 16px;min-height:56px}
- #who,#top-checked,#wall-open{display:none}
+ #who,#top-checked,#top-login,#wall-open{display:none}
  .lbl.long{display:none}.lbl.short{display:inline}
  .pill .pw{display:none} #sign-out{min-height:34px;padding:0 10px;font-size:13px}
  nav{position:fixed;left:0;right:0;bottom:0;z-index:7;background:#0e141c;border-top:1px solid var(--line);justify-content:space-around;
@@ -630,6 +631,12 @@ JS = r'''"use strict";
     if (d.toDateString() === now.toDateString()) return t;
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " " + t;
   }
+  function until(time) {   // how long from now until an epoch time
+    var s = Math.max(0, Math.floor(time - Date.now() / 1000));
+    return s < 5400 ? Math.max(1, Math.round(s / 60)) + " min" : Math.round(s / 3600) + " h";
+  }
+  var SOON = 2 * 3600;      // a login that ends within this is said on its card and in the top bar
+  function endsSoon(c) { return !c.expired && c.expires > 0 && c.expires - Date.now() / 1000 < SOON; }
   function ago(seconds) {
     var s = Math.max(0, Math.floor(Date.now() / 1000 - seconds));
     if (s < 90) return s + " s";
@@ -1047,8 +1054,9 @@ JS = r'''"use strict";
         c.problems ? "▲ " + c.problems + (c.problems === 1 ? " problem" : " problems")
           : c.expired ? "login expired" : c.paused ? "paused" : c.blind ? "○ can't see" : "● healthy"));
       card.appendChild(head);
-      var line = c.expired ? "run kubectl vsphere login again" : c.line.replace(/^vSphere namespace [^:]+: /, "");
+      var line = c.expired ? "run ./ts login on the hub" : c.line.replace(/^vSphere namespace [^:]+: /, "");
       card.appendChild(el("span", "muted small", (ROLE[c.role] || c.kind) + " · " + line));
+      if (endsSoon(c)) card.appendChild(el("span", "warn small", "login ends in " + until(c.expires) + ": ./ts login renews it"));
       if (c.spaces && c.spaces.length) {  // pods per namespace: select one to see its pods; system ones fold away
         var sp = el("div", "spaces small"), sysPods = 0, sysSpaces = 0, all = !!showSystem[c.name];
         sp.setAttribute("aria-label", "Pods per namespace");
@@ -1453,6 +1461,12 @@ JS = r'''"use strict";
     } else {
       pill.className = "pill good"; pill.appendChild(el("span", "", "●")); pill.appendChild(el("b", "", "All clear"));
     }
+    var ending = (h.clusters || []).filter(endsSoon).sort(function (a, b) { return a.expires - b.expires; });
+    $("top-login").hidden = !ending.length;
+    if (ending.length) {
+      $("top-login").textContent = (ending.length === 1 ? "1 login ends" : ending.length + " logins end") + " in " + until(ending[0].expires);
+      $("top-login").title = ending.map(function (c) { return c.name; }).join(", ") + ": run ./ts login on the hub to renew";
+    }
     $("top-checked").textContent = h.checked ? "checked " + ago(h.checked) + " ago" : "";
     $("top-checked").className = "muted small checked-note" + (late(h) ? " late" : "");
     var running = h.problems.filter(function (p) { return p.trace && (p.trace.state === "running" || p.trace.state === "waiting"); }).length + (busy ? 1 : 0);
@@ -1531,7 +1545,7 @@ JS = r'''"use strict";
     var m = /(\d+) of (\d+) machines running/.exec(c.line), k = /(\d+) nodes?, (\d+) pods/.exec(c.line);
     if (m) bigNumber(card, m[1] + "/" + m[2], "machines");
     else if (k) bigNumber(card, k[2], "pods · " + k[1] + " nodes");
-    var line = c.expired ? "run kubectl vsphere login again" : c.paused ? "paused: VMware won't repair, scale or upgrade it" : "";
+    var line = c.expired ? "run ./ts login on the hub" : c.paused ? "paused: VMware won't repair, scale or upgrade it" : "";
     if (!line && c.spaces && c.spaces.length) {
       line = c.spaces.filter(function (s) { return s.problems || !SYSTEM.test(s.name); }).slice(0, 4)
         .map(function (s) { return s.name + " " + s.pods + (s.problems ? " ▲" + s.problems : ""); }).join(" · ");

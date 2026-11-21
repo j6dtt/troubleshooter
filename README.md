@@ -120,6 +120,18 @@ kubeconfig per cluster in `./kube`, using `scripts/make-kubeconfig.sh <name>
 Secrets and anything outside `k8s/*.yaml`. To cut access: `kubectl delete
 namespace troubleshooter`.
 
+### Renewing logins: `./ts login`
+
+A `kubectl vsphere login` token lasts about 10 hours. `./ts login` reads the
+logins already in your kubeconfig (each Supervisor, its vSphere namespaces,
+each VKS cluster), asks for your password once, and logs in to each again.
+Your current context is kept, and the page shows the new logins within a
+minute. The password goes to kubectl only, in its environment; it is never
+stored. A refused password stops it at once, so it is tried one time only.
+
+Two hours before a login ends, its card and the top bar say "login ends in
+50 min", and `./ts` says so when it starts.
+
 ### A login that does not expire (workload clusters)
 
 A `kubectl vsphere login` token lasts about 10 hours; then the cards say

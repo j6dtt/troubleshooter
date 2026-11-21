@@ -18,6 +18,8 @@ COMMANDS
   ./ts check --deep        run every Kubernetes tool on every
                            login, look-only, no model: one line
                            each, ok / DENIED / FAIL
+  ./ts login               renew every kubectl vsphere login with
+                           one password
   ./ts watch               watch health; speak only when it changes
   ./ts tools               list every tool it can use
   ./ts setup               make the keys for several hosts (once)
@@ -252,9 +254,29 @@ Set kube-home in compose.yaml to your ~/.kube, full path. Then:
 The log says "The Kubernetes logins changed: added prod1".
 Problems a new login brings are shown but not auto-traced: they were
 there before Tracer could see them. Tokens last about 10 hours; then
-the cards say "login expired" until you log in again. Everyone on the
+the cards say "login expired" until you log in again (./ts login,
+below). Everyone on the
 page sees with your login, look-only. ./kube still works, and a file
 there wins over a context of the same name in ~/.kube.
+
+RENEWING LOGINS (./ts login)
+
+  ./ts login
+        -> reads the logins kubectl vsphere login wrote before:
+           each Supervisor, its namespaces, each VKS cluster
+        -> asks for your password once
+        -> logs in to each again; your current context is kept
+        -> the page shows them within a minute, no restart
+
+The password goes to kubectl only, for that moment: it is never
+stored, shown or put on a command line. If it is refused, ./ts login
+stops at once, so a wrong password is tried one time only. It renews
+your kubeconfig, and kube-home's when that is another file. A login
+it has never seen needs one kubectl vsphere login by hand first.
+
+Two hours before a login ends, its card says "login ends in 50 min",
+the top bar says "2 logins end in 50 min", and ./ts says so when it
+starts. A login made with scripts/make-kubeconfig.sh has no end.
 
 SEVERAL HOSTS
 
@@ -494,8 +516,8 @@ WHEN SOMETHING IS WRONG
       kubectl isn't working on this host, ./kube is empty, and no
       ~/.kube is mounted (kube-home).
   A card says "login expired"
-      Run kubectl vsphere login again; the card is back within a
-      minute.
+      Run ./ts login on the hub (or kubectl vsphere login); the
+      card is back within a minute.
   Answer cut off
       Raise llm-max-tokens.
   The conversation is too long

@@ -291,7 +291,7 @@ class Health:
                                         for p in self.open.values()), key=lambda p: -p["since"]),
                     "lines": self.lines, "hosts": self.hosts, "events": self.events[-60:][::-1],
                     "clusters": [{"name": c["where"], "kind": c["kind"], "line": c["line"], "problems": c["problems"],
-                                  "role": c.get("role", ""), "expired": c.get("expired", False),
+                                  "role": c.get("role", ""), "expired": c.get("expired", False), "expires": c.get("expires", 0),
                                   "paused": c.get("paused", False), "blind": c.get("blind", False),
                                   "context": c.get("context", ""), "spaces": c.get("spaces", []),
                                   "more_spaces": c.get("more_spaces", 0)}
