@@ -161,6 +161,31 @@ itself recorded.
     oldest go first. They hold names, images, counts and states: no
     settings values, no Secrets.
 
+What the page's log (What changed) holds, and how it is kept true:
+
+  - Only what could explain a problem: a new image, a settings or
+    spec change, a scale, a changed configmap of your own apps,
+    a restart with its reason and exit code, a node's Ready, a
+    VKS cluster's phase, version or pause, a machine's phase, a
+    VM's power state, and what was really made or removed.
+  - The time is Docker's or Kubernetes' own whenever they keep
+    one, even for a moment when Tracer was not running. Where
+    nothing dates a change and nothing was recording, the line
+    gives the window: "sometime between 18:02 and 23:15".
+  - "new" needs proof: the cluster's own made-time must fall after
+    the last record. Something older that only could not be read
+    for a while is no change, and gets no line.
+  - "gone" is only said after a list was read and it was not in it.
+    A list that could not be read keeps its last known state.
+  - One line per thing: a rollout, a restart or a node's Ready that
+    the cluster dates itself is said by the cluster's own line.
+  - The same thing changing 4 times or more in the period shown is
+    one line with a count. A new image is never folded.
+  - Left out: the namespaces Kubernetes and VMware run themselves
+    (kube-*, vmware-system-*, tkg-* and the like), except a new
+    image there; kapp's reconcile notes; how many pods are ready
+    (that shows as a problem); one-off runs (docker run --rm).
+
 WATCH
 
   ./ts watch               check every 60 seconds

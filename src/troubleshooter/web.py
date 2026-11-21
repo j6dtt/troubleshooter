@@ -151,12 +151,13 @@ class Site:
         if now - self._kube[0] > 60:  # what the clusters themselves record; asked at most once a minute
             def own(cid):
                 try:
-                    return [{"time": when, "where": cid, "lane": cid, "text": text, "kind": "cluster"}
-                            for when, text in history.timeline_rows(box, cid, now - 24 * history.KEEP_DAYS * 3600)]
+                    return [{"time": when, "where": cid, "lane": cid, "text": text, "kind": "cluster", "about": about}
+                            for when, text, about in history.timeline_rows(box, cid, now - 24 * history.KEEP_DAYS * 3600)]
                 except Exception:
                     return []
             with ThreadPoolExecutor(max_workers=8) as pool:
                 self._kube = (now, [row for rows in pool.map(own, list(box.clusters)) for row in rows])
+        found = history.fold(found, self._kube[1])  # what the cluster dates itself is said once, by the cluster
         found += [e for e in self._kube[1] if e["time"] >= since]
         found += [{"time": e["time"], "where": e.get("lane", ""), "lane": e.get("lane", box.here), "text": e["text"],
                    "kind": {"new": "problem", "traced": "traced"}.get(e["kind"], "cleared"), "link": e.get("link"),

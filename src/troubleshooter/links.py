@@ -31,8 +31,9 @@ def subject(text):
     return head.split(" of cluster ")[0].strip()
 
 
-def names(text):
-    found = subject(text)
+def names(text, name=None):
+    """The names a change is about. `name` is the row's own, when it has one; else it is read from the text."""
+    found = name or subject(text)
     return {n.lower() for n in (found, found.split("/")[-1]) if len(n) >= 3}
 
 
@@ -55,12 +56,14 @@ def find(problem, changes, minutes):
     window, best = minutes * 60, None
     said = problem["text"].lower()
     for c in changes:
-        if c.get("lane") != problem.get("lane") or is_symptom(c["text"]):
+        if c.get("lane") != problem.get("lane") or c.get("repeats"):
+            continue  # another lane, or something that keeps changing by itself: not this problem's cause
+        if c["symptom"] if "symptom" in c else is_symptom(c["text"]):
             continue
         after = min(c.get("after", c["time"]), c["time"])
         if after > problem["time"] or c["time"] < problem["time"] - window:
             continue
-        strong = any(n in said for n in names(c["text"]))
+        strong = any(n in said for n in names(c["text"], c.get("name")))
         gap = max(0, problem["time"] - c["time"])
         rank = (strong, -gap)
         if best is None or rank > best[0]:

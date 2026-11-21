@@ -865,16 +865,177 @@ class History(unittest.TestCase):
         then = snapshot(1000)
         now = snapshot(5000, image="shop/web:1.3", ready=1, restarts={"shop/web-7": 6}, config="250", machine="Provisioning")
         now["docker"]["relay"].update(image="relay:5", started="2026-11-15T03:00:00Z")
-        now["docker"]["extra"] = {"image": "tool:1", "state": "running"}
+        now["docker"]["extra"] = {"image": "tool:1", "state": "running", "created": "1970-01-01T01:00:00Z"}
         out = "\n".join(history.differences(then, now))
         for line in ("- container relay: image relay:4 -> relay:5; started again at 2026-11-15 03:00 UTC",
-                     "- new container extra: image tool:1, running",
+                     "- new container extra: image tool:1, running (made 1970-01-01 01:00 UTC)",
                      "- deployment shop/web: image shop/web:1.2 -> shop/web:1.3; ready 3 -> 1",
-                     "- new pod shop/web-7: restarted 6 times",
+                     "- pod shop/web-7: restarted 6 times",
                      "- configmap shop/web-config: its content changed",
                      "- VKS machine team-a/prod1-w-2 of cluster prod1: Running -> Provisioning"):
             self.assertIn(line, out)
         self.assertNotIn("node", out)
+
+    def test_new_needs_the_sources_own_proof(self):
+        """Only the source's made-time makes a thing "new": a record that missed it does not."""
+        then, now = snapshot(10000), snapshot(20000)
+        vm_old, vm_new, vm_unknown = ("VM team-a/old-1 of cluster prod1", "VM team-a/new-1 of cluster prod1",
+                                      "VM team-a/what-1 of cluster prod1")
+        now["k8s"]["a"]["vks"].update({vm_old: "PoweredOn", vm_new: "PoweredOn", vm_unknown: "PoweredOn"})
+        now["k8s"]["a"]["vks_born"] = {vm_old: 500, vm_new: 15000}        # made long before / between the two records
+        now["docker"]["old-box"] = {"image": "a:1", "state": "running", "created": "1970-01-01T00:10:00Z"}
+        rows = {r["line"]: r for r in history.changes(then, now)}
+        text = "\n".join(rows)
+        self.assertNotIn("old-1", text)                                   # there all along: no change, no line
+        self.assertNotIn("old-box", text)
+        new = rows[f"- new VKS {vm_new}: PoweredOn"]
+        self.assertEqual(new["when"], 15000)                              # the source's time, not ours
+        unknown = rows[f"- first seen: VKS {vm_unknown} (PoweredOn)"]     # no made-time: never called new
+        self.assertIsNone(unknown["when"])
+        self.assertNotIn("first seen", "\n".join(r["line"] for r in history.changes(then, now, quiet=True)))
+        self.assertIn(f"- new VKS {vm_new}: PoweredOn (made 1970-01-01 04:10 UTC)", history.differences(then, now))
+
+    def test_a_change_carries_dockers_or_the_clusters_own_time(self):
+        then, now = snapshot(10000), snapshot(20000, restarts={"shop/web-7": 2})
+        now["docker"]["relay"].update(state="exited", finished="1970-01-01T04:00:00Z", exit=137)
+        now["k8s"]["a"]["nodes"]["n1"].update(ready="False", ready_at=16000)
+        now["k8s"]["a"]["configmaps"]["shop/web-config"] = "999"
+        now["k8s"]["a"]["restart_last"] = {"shop/web-7": {"at": 17000, "why": "OOMKilled", "code": 137}}
+        when = {r["line"]: r["when"] for r in history.changes(then, now)}
+        self.assertEqual(when["- container relay: state running -> exited (exit code 137)"], 14400)
+        self.assertEqual(when["- node n1: Ready True -> False"], 16000)
+        self.assertEqual(when["- pod shop/web-7: restarted 2 times; the last run ended OOMKilled, exit code 137"], 17000)
+        self.assertIsNone(when["- configmap shop/web-config: its content changed"])   # nothing dates it: a window
+        now["k8s"]["a"]["nodes"]["n1"]["ready_at"] = 5                    # a time outside the two records is not used
+        self.assertIsNone({r["line"]: r["when"] for r in history.changes(then, now)}["- node n1: Ready True -> False"])
+
+    def test_after_a_gap_the_log_gives_a_window_not_a_moment(self):
+        first, later = snapshot(1000000), snapshot(1050000, config="250")
+        later["docker"]["relay"].update(state="exited", finished=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1020000)))
+        for snap in (first, later):
+            history.save(self.s, snap)
+        names = history._files(self.s)
+        os.utime(os.path.join(history.folder(self.s), names[0]), (1003000, 1003000))   # last seen unchanged then
+        found = {e["text"].split(" (")[0]: e for e in history.events(self.s, 0)}
+        vague = found["configmap shop/web-config: its content changed"]
+        self.assertFalse(vague["exact"])
+        self.assertIn("nothing was recording then)", vague["text"])
+        self.assertIn("sometime between", vague["text"])
+        self.assertEqual((vague["after"], vague["seen"], vague["time"]), (1003000, 1050000, 1050000))
+        exact = found["container relay: state running -> exited"]
+        self.assertEqual((exact["exact"], exact["time"]), (True, 1020000))   # Docker's own time, inside the gap
+        self.assertNotIn("sometime", exact["text"])
+        later_only = [e["text"].split(" (")[0] for e in history.events(self.s, 1030000)]
+        self.assertEqual(later_only, ["configmap shop/web-config: its content changed"])   # 1020000 is before the period
+
+    def test_the_pages_log_holds_only_what_could_explain_a_problem(self):
+        then = snapshot(10000)
+        now = snapshot(20000, image="shop/web:1.3", ready=1, restarts={"shop/web-7": 6}, config="250")
+        for snap, rv, ready in ((then, "1", 2), (now, "2", 1)):
+            part = snap["k8s"]["a"]
+            part["configmaps"].update({"vmware-system-tkg/prod1-antrea": rv, "kube-system/leader": rv,
+                                       "shop/kapp-thing.app": rv, "shop/kapp-thing.app-change-ab1" + rv: rv})
+            part["workloads"]["daemonset kube-system/dns"] = {"images": ["dns:1"], "replicas": None, "ready": ready, "version": int(rv)}
+            part["workloads"]["deployment kube-system/proxy"] = {"images": ["proxy:" + rv], "replicas": 1, "ready": 1, "version": 1}
+        now["k8s"]["a"]["vks"]["VM team-a/what-1 of cluster prod1"] = "PoweredOn"   # no made-time: only first seen
+        now["k8s"]["a"]["nodes"]["n1"]["ready"] = "False"
+        then["docker"]["chrome-test"] = {"image": "x", "state": "exited", "oneoff": True}   # docker run --rm: gone again
+        now["docker"]["job-run-1"] = {"image": "x", "state": "running", "oneoff": True, "created": "1970-01-01T04:00:00Z"}
+        quiet = history.changes(then, now, quiet=True)
+        self.assertEqual(sorted(r["line"] for r in quiet), sorted([
+            "- deployment shop/web: image shop/web:1.2 -> shop/web:1.3",          # your rollout
+            "- deployment kube-system/proxy: image proxy:1 -> proxy:2",            # a system upgrade still shows
+            "- node n1: Ready True -> False",
+            "- pod shop/web-7: restarted 6 times",
+            "- configmap shop/web-config: its content changed"]))                  # your app's settings
+        full = "\n".join(r["line"] for r in history.changes(then, now))
+        for kept in ("ready 3 -> 1", "restarted 6 times", "first seen: VKS VM team-a/what-1", "chrome-test is gone"):
+            self.assertIn(kept, full)                                              # the chat's tool still gets the detail
+        for never in ("vmware-system-tkg", "kube-system/leader", "kapp-thing"):
+            self.assertNotIn(never, full)                                          # they rewrite themselves all day
+
+    def test_each_row_says_what_it_is_about(self):
+        then = snapshot(10000)
+        now = snapshot(20000, image="shop/web:1.3", restarts={"shop/web-7": 6}, config="250", machine="Deleting")
+        now["k8s"]["a"]["nodes"]["n1"]["ready"] = "False"
+        now["docker"]["relay"].update(state="exited")
+        rows = {r["line"]: r for r in history.changes(then, now, quiet=True)}
+        web = rows["- deployment shop/web: image shop/web:1.2 -> shop/web:1.3"]
+        self.assertEqual((web["about"], web["name"], web["symptom"], web["key"]),
+                         (["rollout", "deployment shop/web"], "shop/web", False, None))   # a new image is never folded
+        pod = rows["- pod shop/web-7: restarted 6 times"]
+        self.assertEqual((pod["about"], pod["name"], pod["symptom"]), (["restart", "pod shop/web-7"], "shop/web-7", True))
+        node = rows["- node n1: Ready True -> False"]
+        self.assertEqual((node["about"], node["symptom"]), (["ready", "node n1"], True))
+        settings = rows["- configmap shop/web-config: its content changed"]
+        self.assertEqual((settings["about"], settings["symptom"], settings["key"]), (None, False, "configmap shop/web-config content"))
+        machine = rows["- VKS machine team-a/prod1-w-2 of cluster prod1: Running -> Deleting"]
+        self.assertFalse(machine["symptom"])                                       # a machine going away can be a cause
+        self.assertTrue(rows["- container relay: state running -> exited"]["symptom"])
+
+    def test_scaling_and_settings_are_rows_of_their_own(self):
+        then, now = snapshot(10000), snapshot(20000)
+        now["k8s"]["a"]["workloads"]["deployment shop/web"].update(replicas=5, version=5)   # scaled: the version moves too
+        self.assertEqual([r["line"] for r in history.changes(then, now, quiet=True)], ["- deployment shop/web: scaled from 3 to 5"])
+        now = snapshot(20000)
+        now["k8s"]["a"]["workloads"]["deployment shop/web"]["version"] = 5              # e.g. kubectl rollout restart
+        rows = history.changes(then, now, quiet=True)
+        self.assertEqual([r["line"] for r in rows], ["- deployment shop/web: its settings or spec changed, same image"])
+        self.assertEqual(rows[0]["about"], ["rollout", "deployment shop/web"])
+        now = snapshot(20000)
+        now["k8s"]["a"]["workloads"]["deployment shop/new"] = {"images": ["shop/new:1"], "replicas": 2, "ready": 2, "version": 1, "born": 15000}
+        del now["k8s"]["a"]["workloads"]["deployment shop/web"]
+        self.assertEqual([r["line"] for r in history.changes(then, now, quiet=True)],
+                         ["- new deployment shop/new: image shop/new:1", "- deployment shop/web is gone"])
+
+    def test_a_vks_clusters_line_says_which_part_changed(self):
+        key = "cluster team-a/prod1 of cluster prod1"
+        then, now = snapshot(10000), snapshot(20000)
+        then["k8s"]["a"]["vks"][key] = "Provisioned v1.33.6+vmware.1-fips"
+        for state, said in (("Provisioned v1.33.6+vmware.1-fips paused", "paused: VMware won't repair, scale or upgrade it"),
+                            ("Provisioned v1.34.1+vmware.1-fips", "version v1.33.6+vmware.1-fips -> v1.34.1+vmware.1-fips"),
+                            ("Failed v1.33.6+vmware.1-fips", "phase Provisioned -> Failed")):
+            now["k8s"]["a"]["vks"][key] = state
+            self.assertEqual([r["line"] for r in history.changes(then, now, quiet=True)], [f"- VKS cluster team-a/prod1: {said}"])
+        then["k8s"]["a"]["vks"][key] = "Provisioned v1.33.6+vmware.1-fips paused"
+        now["k8s"]["a"]["vks"][key] = "Provisioned v1.33.6+vmware.1-fips"
+        rows = history.changes(then, now, quiet=True)
+        self.assertEqual([(r["line"], r["name"]) for r in rows], [("- VKS cluster team-a/prod1: unpaused", "team-a/prod1")])
+
+    def test_one_line_per_happening_the_clusters_own_line_wins(self):
+        def change(about, after, seen, lane="a"):
+            return {"lane": lane, "about": about, "after": after, "seen": seen, "time": seen, "text": str(about)}
+        rollout, restart = ["rollout", "deployment shop/web"], ["restart", "pod shop/web-7"]
+        found = [change(rollout, 1700, 2000), change(restart, 4700, 5000), change(None, 1700, 2000),
+                 change(rollout, 1700, 2000, lane="b")]
+        cluster = [{"lane": "a", "about": rollout, "time": 1850},      # the same rollout, with the cluster's own time
+                   {"lane": "a", "about": restart, "time": 9000},      # a later restart: says nothing about the one at 5000
+                   {"lane": "a", "about": None, "time": 1850}]
+        kept = history.fold(found, cluster)
+        self.assertEqual([(e["lane"], e["about"]) for e in kept], [("a", restart), ("a", None), ("b", rollout)])
+        self.assertEqual(history.fold(found, []), found)
+
+    def test_the_same_thing_over_and_over_is_one_line_with_a_count(self):
+        for n in range(6):   # a setting that something keeps rewriting, and five real rollouts
+            history.save(self.s, snapshot(1000000 + n * 300, config=str(100 + n), image=f"shop/web:1.{n}"))
+        found = history.events(self.s, 0)
+        settings = [e for e in found if e["text"].startswith("configmap shop/web-config")]
+        self.assertEqual(len(settings), 1)
+        self.assertEqual(settings[0]["repeats"], 5)
+        self.assertEqual(settings[0]["time"], 1000000 + 5 * 300)                        # the newest one
+        self.assertIn("(5 such changes since 13:51 UTC; only the newest is shown)", settings[0]["text"])
+        self.assertEqual(len([e for e in found if "image shop/web" in e["text"]]), 5)   # a new image is never folded
+        change = {**settings[0], "lane": "a"}
+        self.assertIsNone(links.find({"time": 1000000 + 5 * 300 + 60, "lane": "a", "text": "web-config is broken"}, [change], 30))
+
+    def test_a_link_uses_the_rows_own_name_and_kind(self):
+        problem = {"time": 5000, "lane": "a", "text": "pod shop/web-7 is CrashLoopBackOff"}
+        row = {"time": 4900, "after": 4600, "lane": "a", "name": "shop/web",
+               "text": "deployment shop/web: image a -> b (sometime between 11-20 18:02 and 23:15 UTC: nothing was recording then)"}
+        self.assertEqual(links.find(problem, [{**row, "symptom": False}], 30)["strength"], "linked")
+        self.assertIsNone(links.find(problem, [{**row, "symptom": True}], 30))          # a symptom is never a cause
+        gone = {"time": 4900, "lane": "a", "name": "shop/web-7", "symptom": False, "text": "pod shop/web-7 is gone"}
+        self.assertEqual(links.find(problem, [gone], 30)["strength"], "linked")
 
     def test_nothing_changed_is_empty(self):
         self.assertEqual(history.differences(snapshot(1000), snapshot(5000)), [])
@@ -2459,6 +2620,43 @@ class VsphereScope(unittest.TestCase):
         self.assertIn("vks_cluster_health", text)
         self.assertEqual(code, 0, text)
         self.assertIn("DENIED k8s_get nodes", text)  # a namespace login may not list nodes: expected, not a bug
+
+    def test_vks_that_could_not_be_read_is_not_gone_then_new(self):
+        """A failed list was recorded as empty: every VM showed as gone, then as "new ...: PoweredOn"."""
+        vms = {"VM team-a/prod1-w1 of cluster prod1": "PoweredOn"}
+        first = {"time": 1, "host": "h", "docker": {}, "k8s": {"sup": {"nodes": {}, "vks": dict(vms)}}}
+        unread = {"time": 2, "host": "h", "docker": {}, "k8s": {"sup": {"nodes": {}, "vks": None}}}
+        kept = history._merge(first, unread)
+        self.assertEqual(kept["k8s"]["sup"]["vks"], vms)                 # last known, not empty
+        self.assertEqual(history.differences(first, kept), [])
+        back = {"time": 3, "host": "h", "docker": {}, "k8s": {"sup": {"nodes": {}, "vks": dict(vms)}}}
+        self.assertEqual(history.differences(kept, history._merge(kept, back)), [])
+        off = {"time": 4, "host": "h", "docker": {}, "k8s": {"sup": {"nodes": {}, "vks": {**vms, "VM team-a/prod1-w1 of cluster prod1": "PoweredOff"}}}}
+        self.assertIn("PoweredOff", "\n".join(history.differences(kept, off)))   # a real change still shows
+
+        class Box:
+            def _kubectl(self, cid, *args):
+                return ["kubectl", *args]
+
+            def _role(self, cid):
+                return "supervisor"
+
+            def _cluster(self, cid):
+                return tools.Cluster(cid, "", cid)
+
+        def fake(argv, timeout=30, parsed=False):
+            if "/version" in argv:
+                return reply(True, "{}")
+            if "configmaps" in argv:
+                return reply(True, "ns a.app 1 2026-01-01T00:00:00Z\nns a.app-change-ab12c 2 2026-01-01T00:00:00Z\n"
+                                   "ns settings 3 2026-01-01T00:00:00Z")
+            if any("virtualmachine" in a for a in argv):
+                return reply(False, "Unable to connect to the server: timeout")
+            return reply(True, json.dumps({"items": []}))
+        with mock.patch.object(history, "run", fake):
+            snap = history._kube(Box(), "sup")
+        self.assertIsNone(snap["vks"])
+        self.assertEqual(list(snap["configmaps"]), ["ns/settings"])       # kapp's reconcile notes are left out
 
     def test_an_expired_login_is_said_not_counted(self):
         self.expired = {"team-a", "team-a-again", "prod1"}

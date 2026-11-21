@@ -47,6 +47,11 @@ Log: `logs/<date>.log`, including every approval and refusal.
   hours?" to compare then with now. Snapshots are in the log folder under
   `snapshots/`: compressed, kept 7 days, never more than 50 MB in all (the
   oldest go first), with no settings values or Secrets.
+  The page's log holds only what could explain a problem, one line per thing.
+  Its times are Docker's or Kubernetes' own where they keep one; "new" must be
+  proven by the cluster's own made-time, and a list that could not be read is
+  unknown, never "gone". What rewrites itself all day (system namespaces'
+  settings, kapp's notes) is left out; `./ts --help` has the full rules.
 - **`./ts watch`:** checks health every 60 seconds (`--every N` to change) and
   prints only what is NEW or OK AGAIN. No model is used. Leave it running to
   always have a history for "what changed".
