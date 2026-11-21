@@ -120,6 +120,46 @@ kubeconfig per cluster in `./kube`, using `scripts/make-kubeconfig.sh <name>
 Secrets and anything outside `k8s/*.yaml`. To cut access: `kubectl delete
 namespace troubleshooter`.
 
+### A login that does not expire (workload clusters)
+
+A `kubectl vsphere login` token lasts about 10 hours; then the cards say
+"login expired". `scripts/make-kubeconfig.sh` gives Tracer its own account
+inside a cluster instead. Its token is a secret in that cluster, with no
+vSphere time limit: it works until you delete it.
+
+    you: logged in to the cluster as admin
+      |  scripts/make-kubeconfig.sh NAME --look-only
+      v
+    in the cluster:  namespace, service account,
+                     token and role "troubleshooter"
+    on this host:    kube/NAME.yaml (mode 600)
+      |
+      v
+    the page and ./ts both read ./kube
+
+Once per workload cluster:
+
+    kubectl vsphere login --server=<supervisor> \
+      --tanzu-kubernetes-cluster-namespace <namespace> \
+      --tanzu-kubernetes-cluster-name <cluster>
+    kubectl config use-context <cluster>
+    scripts/make-kubeconfig.sh <cluster> --look-only
+    ./ts check
+
+- `--look-only`: get, list and watch on pods, logs, events, nodes, workloads
+  and storage in every namespace (`k8s/look.yaml`). No Secrets, no changes.
+- Without it, the fix rights too (`k8s/fix.yaml`): delete a pod, exec, restart
+  and scale, for fixes you approve in `./ts`. The page looks only either way.
+- Nothing runs in the cluster: no pod and no image, so it works air-gapped.
+- Name it after the cluster: a file in `./kube` wins over a context of the
+  same name in `~/.kube`, so the card stays the same.
+- `kube/NAME.yaml` holds the token: keep the folder readable only by you.
+- It needs `scripts/make-kubeconfig.sh`, `k8s/look.yaml` and `k8s/fix.yaml`
+  on the host where you run it.
+- It covers what is inside the cluster. VKS health (machines, paused,
+  version) is asked through the Supervisor login, which still expires.
+- To cut access: `kubectl delete namespace troubleshooter` on that cluster.
+
 Cluster nodes are VMs: the `host_` tools see only the Docker host running this.
 
 ## Safety

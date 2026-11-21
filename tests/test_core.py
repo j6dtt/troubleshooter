@@ -1629,6 +1629,12 @@ class Page(unittest.TestCase):
         self.assertIn('"model": s.llm_model if s.web_show_model else ""', src)
         self.assertIn('(me.model ? " · " + me.model : "")', webpage.JS)
 
+    def test_the_page_learns_of_new_logins_without_a_reload(self):
+        """The Context list on Trace was read once, when the page loaded: a login made later never showed."""
+        self.assertIn('"contexts": list(site.health.box.clusters)', inspect.getsource(web))
+        self.assertIn("h.contexts.join", webpage.JS)
+        self.assertIn('$("context-pick").hidden = !me.kubernetes;', webpage.JS)
+
     def test_sign_in_and_lockout(self):
         token, why = self.site.sign_in("alice", "right password", "10.0.0.5")
         self.assertEqual(self.site.who(token), "alice")

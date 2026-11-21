@@ -359,7 +359,7 @@ def _handler(site):
                     "user": user, "host": box.here, "model": s.llm_model if s.web_show_model else "", "kubernetes": bool(box.clusters),
                     "hosts": [box.here, *box.agents], "contexts": list(box.clusters)})
             if parts == ["health"]:
-                return self._send(200, site.health.state())
+                return self._send(200, {**site.health.state(), "contexts": list(site.health.box.clusters)})
             if parts == ["container"]:
                 try:
                     return self._send(200, site.container(query.get("host", ""), query.get("name", "")))

@@ -705,6 +705,13 @@ JS = r'''"use strict";
     if (!me) return;
     api("GET", "/api/health").then(function (h) {
       health = h;
+      if (h.contexts && h.contexts.join("\n") !== (me.contexts || []).join("\n")) {   // a login came or went since the page loaded
+        var was = $("context").value;
+        me.contexts = h.contexts; me.kubernetes = h.contexts.length > 0;
+        fill($("context"), me.contexts, function (c) { return c; });
+        if (me.contexts.indexOf(was) >= 0) $("context").value = was;
+        $("context-pick").hidden = !me.kubernetes;
+      }
       var n = h.problems.length;
       $("map-count").hidden = !n; $("map-count").textContent = n;
       drawTop();
